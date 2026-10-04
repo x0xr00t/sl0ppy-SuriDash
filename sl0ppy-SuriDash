@@ -1,0 +1,1714 @@
+#!/bin/bash
+# ==============================================================================
+# sl0ppy Suricata Network Security & Threat Intelligence Dashboard  (v1.1)
+# Author : Patrick Hoogeven x0xr00t 
+# Build  : 07042026
+# Name   : SuriDash
+# Veraion: v1.1 
+# ==============================================================================
+# Read-only: nothing in the Suricata configuration is ever modified.
+#
+# v1.1 changes:
+#   COUNTERS
+#     * Every counter key re-audited against the Suricata 7/8 stats tree:
+#         - active flows  -> flow.active          (flow.tcp/udp are CUMULATIVE)
+#         - active TCP    -> tcp.active_sessions  (tcp.sessions is cumulative)
+#         - total flows   -> flow.total
+#         - flow end state-> flow.end.state.* / flow.mgr.*_pruned
+#         - bypass        -> flow_bypassed.local_pkts / local_capture_pkts / pkts
+#         - app errors    -> SUM of app_layer.error.*.{parser,alloc,internal}
+#                            (app_layer.error is an OBJECT, v7.2 read it as 0)
+#         - invented counters (ips.malware_blocked, ips.active_dropped ...)
+#           removed.
+#     * Wildcard paths ("a.*.b") and object-sum lookups in the jq engine.
+#     * Counters your build does NOT expose now show "n/a" instead of a
+#       misleading 0.
+#     * --check prints every counter, its value and the exact stats key it was
+#       resolved from, so you can verify the mapping against YOUR build.
+#   RATES
+#     * Socket rates are computed over the real time between stats snapshots
+#       (Suricata only refreshes dump-counters every stats-interval) and held
+#       until the next snapshot; pps / Mbit/s fall back to live NIC counters
+#       (/proc/net/dev) between ticks, so the bars always move.
+#     * NIC_IFACES="eth1 eth2" restricts the NIC fallback to the sniffing /
+#       bridge interfaces (default: everything except lo/docker/veth/virbr/br-).
+#     * awk output uses %.0f (mawk's %d overflows above 2^31).
+#   HEALTH
+#     * Penalties come from per-cycle deltas and are held for HEALTH_HOLD_S
+#       seconds (default 30), so a problem seen at one stats tick stays visible
+#       instead of flickering for a single refresh. First sample is a baseline
+#       (no false penalty from lifetime totals). Capture-drop penalty uses the
+#       drop ratio of the LAST interval, not lifetime.
+#   UI
+#     * Flicker-free redraw (alternate screen, cursor-home, no full clear).
+#     * Scrolling for frames taller than the terminal: j/k, arrows, PgUp/PgDn,
+#       space/b, g/G.  p = pause, r = refresh now, q = quit.
+#     * Data is never passed through echo -e (signature text containing
+#       backslashes can no longer corrupt the display).
+#     * --once prints a single frame (cron / testing / screenshots).
+#     * EVE/slow refresh are time based, not cycle based.
+#
+# Usage:  sudo ./suridash.sh [-i SECONDS] [--once] [--check] [--debug-counters]
+#         sudo ./suridash.sh --help
+# ==============================================================================
+
+set -u
+
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+    echo "[-] bash >= 4 is required." >&2
+    exit 1
+fi
+
+if [ -n "${LC_ALL:-}" ]; then export LANG="$LC_ALL"; unset LC_ALL; fi
+export LC_NUMERIC=C
+
+Suridash_Version="v1.1"
+
+# ------------------------------------------------------------------------------
+# COLORS & STYLING (real escape characters: safe for printf '%s')
+# ------------------------------------------------------------------------------
+NC=$'\e[0m'; BOLD=$'\e[1m'; DIM=$'\e[2m'; REV=$'\e[7m'
+WHITE=$'\e[97m'; BLUE=$'\e[34m'; GREEN=$'\e[32m'; RED=$'\e[31m'
+YELLOW=$'\e[33m'; CYAN=$'\e[36m'; MAGENTA=$'\e[35m'
+BG_BLUE=$'\e[44m'
+
+# ------------------------------------------------------------------------------
+# CONFIGURATION (all overridable through environment variables)
+# ------------------------------------------------------------------------------
+REFRESH_INTERVAL="${REFRESH_INTERVAL:-2}"
+FAST_LOG="${FAST_LOG:-/var/log/suricata/fast.log}"
+EVE_LOG="${EVE_LOG:-/var/log/suricata/eve.json}"
+
+EVE_SAMPLE_LINES="${EVE_SAMPLE_LINES:-5000}"
+EVE_SAMPLE_LINES_HIGH="${EVE_SAMPLE_LINES_HIGH:-1000}"
+HIGH_LOAD_PPS="${HIGH_LOAD_PPS:-25000}"
+
+EVE_REFRESH_EVERY="${EVE_REFRESH_EVERY:-5}"      # in refresh cycles (x interval)
+SLOW_REFRESH_EVERY="${SLOW_REFRESH_EVERY:-15}"   # in refresh cycles (x interval)
+
+ALERT_SCAN_LINES="${ALERT_SCAN_LINES:-20000}"
+ALERT_MAX_SCAN="${ALERT_MAX_SCAN:-400}"
+ALERT_BOX_LINES="${ALERT_BOX_LINES:-6}"
+
+FP_LABEL="${FP_LABEL:-unit8200}"
+FP_REGEX="${FP_REGEX:-unit8200}"
+FP_HIDE="${FP_HIDE:-0}"
+
+HEALTH_HOLD_S="${HEALTH_HOLD_S:-30}"
+NIC_IFACES="${NIC_IFACES:-}"
+
+SOCKET="${SURICATA_SOCKET:-}"
+DEBUG_COUNTERS="${DEBUG_COUNTERS:-0}"
+DEBUG_RATES="${DEBUG_RATES:-0}"
+ONCE=0
+CHECK_MODE=0
+
+usage() {
+    cat <<EOF
+sl0ppy Suricata Dashboard ${Suridash_Version}
+
+Usage: sudo $0 [options]
+
+  -i, --interval SEC    refresh interval in seconds (default ${REFRESH_INTERVAL})
+      --once            print one frame and exit (no interactive UI)
+      --check           list every counter, its value and the stats key it
+                        resolved from (verifies the mapping on your build)
+      --debug-counters  dump every numeric key your Suricata exposes
+  -V, --version         print version
+  -h, --help            this help
+
+Keys:  q quit | p pause | r refresh now | j/k or arrows scroll | PgUp/PgDn,
+       space/b page | g top | G bottom
+
+Environment: REFRESH_INTERVAL FAST_LOG EVE_LOG SURICATA_SOCKET NIC_IFACES
+  EVE_SAMPLE_LINES EVE_SAMPLE_LINES_HIGH HIGH_LOAD_PPS EVE_REFRESH_EVERY
+  SLOW_REFRESH_EVERY ALERT_SCAN_LINES ALERT_MAX_SCAN ALERT_BOX_LINES
+  FP_LABEL FP_REGEX FP_HIDE HEALTH_HOLD_S DEBUG_RATES
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)        usage; exit 0 ;;
+        -V|--version)     echo "Suridash ${Suridash_Version}"; exit 0 ;;
+        -i|--interval)    [ $# -ge 2 ] || { echo "[-] $1 needs a value" >&2; exit 1; }
+                          REFRESH_INTERVAL="$2"; shift ;;
+        --once)           ONCE=1 ;;
+        --check)          CHECK_MODE=1 ;;
+        --debug-counters) DEBUG_COUNTERS=1 ;;
+        *) echo "[-] Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    esac
+    shift
+done
+
+# ------------------------------------------------------------------------------
+# ROOT CHECK
+# ------------------------------------------------------------------------------
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    printf '%s\n' "${RED}[-] This dashboard requires root privileges (sudo).${NC}"
+    exit 1
+fi
+
+for _v in EVE_SAMPLE_LINES EVE_SAMPLE_LINES_HIGH HIGH_LOAD_PPS EVE_REFRESH_EVERY \
+          SLOW_REFRESH_EVERY ALERT_SCAN_LINES ALERT_MAX_SCAN ALERT_BOX_LINES \
+          REFRESH_INTERVAL HEALTH_HOLD_S; do
+    if ! [[ "${!_v}" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s\n' "${RED}[-] ${_v} must be a positive integer (got: '${!_v}').${NC}"
+        exit 1
+    fi
+done
+[[ "$FP_HIDE" =~ ^[01]$ ]] || FP_HIDE=0
+
+# ------------------------------------------------------------------------------
+# DEPENDENCY CHECK
+# ------------------------------------------------------------------------------
+MISSING=()
+for cmd in jq suricatasc awk sed tail tput date stat sort grep find; do
+    command -v "$cmd" >/dev/null 2>&1 || MISSING+=("$cmd")
+done
+if [ "${#MISSING[@]}" -gt 0 ]; then
+    printf '%s\n' "${RED}[-] Missing dependencies:${NC}"
+    printf '    - %s\n' "${MISSING[@]}"
+    printf '\n%s\n' "${YELLOW}[!] Install requirements:${NC} apt install jq suricata coreutils ncurses-bin"
+    exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# COUNTER MAP  (audited against Suricata 7/8 statistics keys)
+#   NAME:alt1|alt2|alt3   first alternative that EXISTS in the output wins
+#   a+b                   sum of the listed counters inside one alternative
+#   a.*.b                 wildcard: sums b under every child of a
+#   a (an object)         sums every numeric leaf below it
+#   Not found anywhere -> displayed as "n/a" (value stays 0 for arithmetic).
+# ------------------------------------------------------------------------------
+COUNTER_MAP=(
+    "UPTIME_C:uptime"
+    # ---- decoder -------------------------------------------------------------
+    "PKTS:decoder.pkts"
+    "BYTES:decoder.bytes"
+    "DEC_INVALID:decoder.invalid"
+    "ARP_PKTS:decoder.arp"
+    "IPV4_PKTS:decoder.ipv4"
+    "IPV6_PKTS:decoder.ipv6"
+    "TCP_PKTS:decoder.tcp"
+    "UDP_PKTS:decoder.udp"
+    "ICMP_PKTS:decoder.icmpv4+decoder.icmpv6"
+    "AVG_PKT:decoder.avg_pkt_size"
+    "MAX_PKT:decoder.max_pkt_size"
+    # ---- capture -------------------------------------------------------------
+    "KERNEL_PKTS:capture.kernel_packets|capture.kernel_pkts"
+    "KERNEL_DROPS:capture.kernel_drops|capture.kernel_drop"
+    "KERNEL_IFDROPS:capture.kernel_ifdrops"
+    # ---- flow ----------------------------------------------------------------
+    "ACTIVE_FLOWS:flow.active|flow_mgr.flows_active"
+    "TOTAL_FLOWS:flow.total|flow.tcp+flow.udp+flow.icmpv4+flow.icmpv6"
+    "F_TCP:flow.tcp"
+    "F_UDP:flow.udp"
+    "F_ICMP4:flow.icmpv4"
+    "F_ICMP6:flow.icmpv6"
+    "END_NEW:flow.end.state.new|flow.mgr.new_pruned|flow_mgr.new_pruned"
+    "END_EST:flow.end.state.established|flow.mgr.est_pruned|flow_mgr.est_pruned"
+    "END_CLOSED:flow.end.state.closed|flow.mgr.closed_pruned|flow_mgr.closed_pruned"
+    "FLOW_MEMCAP:flow.memcap"
+    "FLOW_MEM_USE:flow.memuse"
+    "FLOW_EMERGENCY:flow.emerg_mode_entered|flow.emergency"
+    "FLOW_WRONG_THR:flow.wrong_thread"
+    "FLOW_TCP_REUSE:flow.tcp_reuse"
+    "FLOW_EVICTED:flow.mgr.flows_evicted|flow_mgr.flows_evicted"
+    # ---- bypass --------------------------------------------------------------
+    "BYP_LOCAL:flow_bypassed.local_pkts"
+    "BYP_CAP:flow_bypassed.local_capture_pkts|flow_bypassed.capture_pkts"
+    "BYP_PKTS:flow_bypassed.pkts"
+    "BYP_CLOSED:flow_bypassed.closed"
+    # ---- IPS (inline modes: NFQ / AF_PACKET IPS / netmap) --------------------
+    "IPS_ACCEPTED:ips.accepted"
+    "IPS_BLOCKED:ips.blocked"
+    "IPS_REJECTED:ips.rejected"
+    "IPS_REPLACED:ips.replaced"
+    # ---- TCP / stream --------------------------------------------------------
+    "TCP_SYN:tcp.syn"
+    "TCP_SYNACK:tcp.synack"
+    "TCP_RST:tcp.rst"
+    "TCP_ACTIVE:tcp.active_sessions"
+    "TCP_SESS:tcp.sessions"
+    "MEMCAP_DROPS:tcp.ssn_memcap_drop"
+    "SEG_MEMCAP:tcp.segment_memcap_drop"
+    "SEG_CACHE:tcp.segment_from_cache"
+    "TCP_BAD_CSUM:tcp.invalid_checksum|tcp.invalid_cksum"
+    "STREAM_MIDSTREAM:tcp.midstream_pickups|tcp.midstream"
+    "TCP_REASM_GAP:tcp.reassembly_gap"
+    "TCP_MEMUSE:tcp.memuse"
+    "TCP_REASM_MEM:tcp.reassembly_memuse"
+    # ---- app-layer (flows detected per protocol, cumulative) -----------------
+    "A_HTTP:app_layer.flow.http"
+    "A_TLS:app_layer.flow.tls"
+    "A_DNS_TCP:app_layer.flow.dns_tcp"
+    "A_DNS_UDP:app_layer.flow.dns_udp"
+    "A_QUIC:app_layer.flow.quic"
+    "A_SSH:app_layer.flow.ssh"
+    "A_FTP:app_layer.flow.ftp"
+    "A_SMB:app_layer.flow.smb"
+    "A_DHCP:app_layer.flow.dhcp"
+    "A_NTP:app_layer.flow.ntp"
+    "A_DCERPC_TCP:app_layer.flow.dcerpc_tcp"
+    "A_DCERPC_UDP:app_layer.flow.dcerpc_udp"
+    "AL_ERR:app_layer.error.*.parser+app_layer.error.*.alloc+app_layer.error.*.internal"
+    "AL_GAP:app_layer.error.*.gap|tcp.reassembly_gap"
+    "AL_FAILED:app_layer.flow.failed_tcp+app_layer.flow.failed_udp"
+    # ---- defrag --------------------------------------------------------------
+    "FRAG_MEMCAP:defrag.memcap_drop|defrag.memcap"
+    "FRAG_MEM_USE:defrag.memuse"
+    "FRAG_MAXHITS:defrag.max_frag_hits"
+    "FRAG_FRAGS:defrag.ipv4.fragments+defrag.ipv6.fragments"
+    "FRAG_REASM:defrag.ipv4.reassembled+defrag.ipv6.reassembled"
+    "FRAG_TIMEOUTS:defrag.ipv4.timeouts+defrag.ipv6.timeouts"
+    # ---- detect --------------------------------------------------------------
+    "ALERTS:detect.alert|detect.alerts"
+    "DETECT_SUPPR:detect.alerts_suppressed"
+    "DETECT_QUEUE:detect.alert_queue_overflow"
+)
+MAP_STR="${COUNTER_MAP[*]}"
+
+declare -A DV=()        # display strings ("n/a" when the build lacks the key)
+declare -A CTR_ALT=()   # which alternative key each counter resolved from
+
+# Initialise every mapped counter to 0 (set -u safe).
+for entry in "${COUNTER_MAP[@]}"; do
+    printf -v "${entry%%:*}" '%s' 0
+    DV["${entry%%:*}"]="n/a"
+    CTR_ALT["${entry%%:*}"]="-"
+done
+
+# ------------------------------------------------------------------------------
+# GLOBAL STATE
+# ------------------------------------------------------------------------------
+DPI_STATUS="Enabled"
+HEALTH_PCT=100
+HEALTH_REASONS=""
+HC=""
+
+UPTIME=0
+RULES_LOADED=0
+RULES_CACHE=0
+JSON_DATA=""
+SOCKET_STATUS="UNKNOWN"
+SURICATA_VERSION="UNKNOWN"
+NOW_TS=0
+FMT_OUT=""
+FRAME=""
+FRAME_LINES=0
+OFFSET=0
+PAUSED=0
+FORCE_REFRESH=0
+INTERACTIVE=0
+STTY_SAVE=""
+
+# EVE STATE
+EVE_EVENTS=0; EVE_THREATS=0; EVE_INFO=0
+EVE_UNIQUE_SIGS=0; EVE_UNIQUE_SRC=0; EVE_UNIQUE_DST=0
+EVE_SEV1=0; EVE_SEV2=0; EVE_SEV3=0; EVE_SEV4=0; EVE_ANOMALY=0
+EVE_HTTP=0; EVE_TLS=0; EVE_DNS=0; EVE_FLOWS=0
+EVE_DISPLAY_BYTES=0
+TOP_SIGS=""; TOP_SRC=""; TOP_DST=""; TOP_CATS=""
+TOP_ISIGS=""
+TOP_HTTP=""; TOP_TLS=""; TOP_DNS=""
+LAST_EVE_TS=0; LAST_SLOW_TS=0
+
+# ALERT SECTION STATE
+ALERT_HI=""; ALERT_INFO=""; CNT_HI=0; CNT_INFO=0; CNT_FP=0
+
+# RATES
+PKT_RATE="0.00"; MBIT_RATE="0.00"; DROP_RATE="0.00"
+ALERT_RATE="0.00"; FLOW_RATE="0.00"
+EFF_PKTS=0; EFF_BYTES=0; EFF_FLOWS=0
+PKT_SRC="none"; BYTE_SRC="none"; FLOW_SRC="none"
+SNAP_TS=0; SNAP_PKTS=0; SNAP_BYTES=0; SNAP_FLOWS=0; SNAP_ALERTS=0; SNAP_DROPS=0
+SNAP_PKT_SRC="none"
+SOCK_PPS="0.00"; SOCK_MBIT="0.00"; SOCK_DROPS="0.00"; SOCK_ALERTS="0.00"; SOCK_FLOWS="0.00"
+SOCK_UNTIL=0
+PREV_TS=0
+NIC_PKTS=0; NIC_BYTES=0; NIC_PREV_PKTS=0; NIC_PREV_BYTES=0; NIC_SEEN=0; NIC_OK=0
+PEAK=1          # rolling pps peak in HUNDREDTHS (floor 0.01 pps)
+PEAK_MB=1       # rolling Mbit/s peak in hundredths
+NEW_PEAK=1
+RATE_SRC="socket"
+CYCLE=0
+COUNTER_RESETS=0
+
+# HEALTH STATE
+declare -A HP_UNTIL=() HP_PEN=() HP_TXT=() PH=()
+HP_ORDER=(capture-drop flow-emergency flow-memcap ssn-memcap-drop
+          segment-memcap-drop frag-memcap alert-queue-overflow
+          app-layer-errors frag-timeouts bad-checksums)
+PH_KD=0; PH_KP=0; PH_INIT=0
+DROP_PCT_NOW="0.00"
+
+UPTIME_BASE=0
+UPTIME_BASE_TS=0
+
+FIXED_PROTOS='["http","tls","dns_tcp","dns_udp","dns","quic","ssh","dhcp","ntp","smb","dcerpc_tcp","dcerpc_udp","ftp"]'
+OTHER_PROTOS=""
+
+BLOCK40='████████████████████████████████████████'
+EMPTY40='░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░'
+GRAPH_MAX=40
+TERM_W=100
+LOAD_LABEL="NORMAL"
+EVE_DISPLAY_SAMPLE="$EVE_SAMPLE_LINES"
+ACTIVE_EVE_LINES="$EVE_SAMPLE_LINES"
+
+# ------------------------------------------------------------------------------
+# JQ / AWK TEMPLATES
+# ------------------------------------------------------------------------------
+read -r -d '' JQ_COUNTERS <<'EOF'
+def unwrap: if type == "object" and has("message") then .message else . end;
+def leafsum:
+    if type == "number" then .
+    elif type == "string" then (tonumber? // null)
+    elif type == "object" then
+        ([.. | numbers] | if length > 0 then add else null end)
+    else null end;
+def wp($o; $p):
+    if ($p | length) == 0 then ($o | leafsum)
+    elif ($o | type) != "object" then null
+    elif $p[0] == "*" then
+        ([ $o[] | wp(.; $p[1:]) | select(. != null) ]
+         | if length > 0 then add else null end)
+    else wp($o[$p[0]]; $p[1:]) end;
+def lookup($obj; $path):
+    if ($obj | type) != "object" then null
+    elif ($obj | has($path)) then ($obj[$path] | leafsum)
+    else wp($obj; ($path | split("."))) end;
+def lookup_sum($root; $expr):
+    [ $expr | split("+") | .[] | lookup($root; .) | select(. != null) ]
+    | if length > 0 then add else null end;
+def val($root; $expr):
+    if ($root | type) == "array" then
+        [ $root[] | lookup_sum(.; $expr) | select(. != null) ]
+        | if length > 0 then add else null end
+    else lookup_sum($root; $expr) end;
+unwrap as $root
+| ($map | split(" ") | map(select(length > 0)) | .[]) as $pair
+| ($pair | split(":")) as $kv
+| ($kv[1] | split("|")) as $alts
+| ([ $alts[] as $a | {a: $a, v: val($root; $a)} | select(.v != null) ] | .[0]) as $hit
+| if $hit == null then "\($kv[0])=NA;-"
+  else "\($kv[0])=\($hit.v | floor | tostring);\($hit.a)" end
+EOF
+
+read -r -d '' JQ_DUMP_KEYS <<'EOF'
+def unwrap: if type == "object" and has("message") then .message else . end;
+def flat(o; p):
+    o | to_entries[] |
+    if (.value | type) == "object" then flat(.value; p + .key + ".")
+    elif (.value | type) == "number" then "\(p)\(.key)\t\(.value)"
+    else empty end;
+[ flat(unwrap; "") ] | sort | .[]
+EOF
+
+read -r -d '' JQ_FIND_RULES <<'EOF'
+[ .. | objects | .rules_loaded? |
+    if type == "number" then .
+    elif type == "string" then tonumber?
+    else null end ]
+| map(select(. != null))
+| if length > 0 then max else 0 end
+EOF
+
+read -r -d '' JQ_EVE_STREAM <<'EOF'
+def san: tostring | gsub("[^ -~]"; "?");
+def is_info:
+    ((.alert.signature? // "") | tostring | test("^ET INFO"; "i"))
+    or ((.alert.severity? // 3) >= 3)
+    or (((.alert.metadata.signature_severity? // [])
+         | if type == "array" then map(tostring | ascii_downcase)
+           else [tostring | ascii_downcase] end)
+        | index("informational") != null);
+fromjson?
+| select(type == "object")
+| (.event_type? // "") as $t
+| (if ($t == "alert" or has("alert")) then
+      ["A",
+       (.alert.severity? // 0),
+       ((.src_ip? // .source_ip? // .src? // "?") | san),
+       ((.dest_ip? // .destination_ip? // .dst? // "?") | san),
+       ((.alert.signature? // .alert.signature_id? // .signature? // "?") | san),
+       ((.alert.category? // "?") | san),
+       (if is_info then "I" else "T" end)]
+   elif $t == "http" then ["H", ((.http.hostname? // .http.host? // .hostname? // .host? // "") | san)]
+   elif $t == "tls"  then ["T", ((.tls.sni? // .tls.server_name? // "") | san)]
+   elif $t == "dns"  then ["D", ((.dns.rrname? // .dns.answers[0].rrname? // .dns.queries[0].rrname? // .dns.query? // .query? // "") | san)]
+   else ["X", ($t | san)]
+   end)
+| @tsv
+EOF
+
+read -r -d '' AWK_EVE_AGG <<'EOF'
+$1 == "A" {
+    sev = $2 + 0
+    if      (sev == 1) s1++
+    else if (sev == 2) s2++
+    else if (sev == 3) s3++
+    else               s4++
+    src = $3; dst = $4; sig = $5; cat = $6; cls = $7
+    if (cls == "I") {
+        a_info++
+        if (sig != "?" && sig != "") c_isig[sig]++
+        next
+    }
+    a_thr++
+    if (src != "?" && src != "" && !(src in useen)) { useen[src]; nu_src++ }
+    if (dst != "?" && dst != "" && !(dst in dseen)) { dseen[dst]; nu_dst++ }
+    if (sig != "?" && sig != "" && !(sig in sseen)) { sseen[sig]; nu_sig++ }
+    if (sig != "?" && sig != "") c_sig[sig]++
+    if (src != "?" && src != "") c_src[src]++
+    if (dst != "?" && dst != "") c_dst[dst]++
+    if (cat != "?" && cat != "") c_cat[cat]++
+    next
+}
+$1 == "H" { http++; if ($2 != "") c_http[$2]++; next }
+$1 == "T" { tls++;  if ($2 != "") c_tls[$2]++;  next }
+$1 == "D" { dns++;  if ($2 != "") c_dns[$2]++;  next }
+{
+    others++
+    t = $2
+    if (t ~ /anomal/) anomaly++
+    if (t == "flow") flows++
+}
+END {
+    total = others + a_thr + a_info + http + tls + dns
+    printf "AGG %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f\n", \
+        total, a_thr+0, a_info+0, nu_sig+0, nu_src+0, nu_dst+0, \
+        s1+0, s2+0, s3+0, s4+0, anomaly+0, http+0, tls+0, dns+0, flows+0
+    top("SIG",  c_sig,  8); top("SRC",  c_src,  8)
+    top("DST",  c_dst,  8); top("CAT",  c_cat,  8)
+    top("ISIG", c_isig, 8)
+    top("HTTP", c_http, 8); top("TLS",  c_tls,  8)
+    top("DNS",  c_dns,  8)
+}
+function top(tag, arr, m,   i, k, best, bestv) {
+    for (i = 0; i < m; i++) {
+        best = ""; bestv = 0
+        for (k in arr)
+            if (arr[k] > bestv) { bestv = arr[k]; best = k }
+        if (best == "") break
+        printf "%s\t%.0f\t%s\n", tag, bestv, best
+        delete arr[best]
+    }
+}
+EOF
+
+read -r -d '' JQ_ALERT_TSV <<'EOF'
+def san: tostring | gsub("[^ -~]"; "?");
+def ep($ip; $p): (($ip // "?") | san) + (if $p != null then ":" + ($p | san) else "" end);
+def is_info:
+    ((.alert.signature? // "") | tostring | test("^ET INFO"; "i"))
+    or ((.alert.severity? // 3) >= 3)
+    or (((.alert.metadata.signature_severity? // [])
+         | if type == "array" then map(tostring | ascii_downcase)
+           else [tostring | ascii_downcase] end)
+        | index("informational") != null);
+fromjson?
+| select(type == "object" and .event_type == "alert")
+| ([ .alert.signature?, .alert.category?, .src_ip?, .dest_ip? ]
+   | map(select(type == "string")) | join(" ")) as $hay
+| [ (.alert.severity // 3),
+    ((.timestamp // "") | tostring | sub("^[^T]*T"; "") | .[0:8] | san),
+    ((.alert.signature_id // "") | san),
+    ((.alert.signature // "?") | san),
+    ep(.src_ip; .src_port),
+    ep(.dest_ip; .dest_port),
+    ((.proto // "") | san),
+    (if ($fp != "") and (try ($hay | test($fp; "i")) catch false) then "FP" else "-" end),
+    (if is_info then "I" else "T" end)
+  ]
+| @tsv
+EOF
+
+read -r -d '' AWK_FASTLOG <<'EOF'
+{
+    gsub(/\033\[[0-9;]*m/, "")
+    n = split($0, p, / *\[\*\*\] */)
+    if (n < 3) next
+    ts = p[1]; sub(/^[^-]*-/, "", ts); sub(/\..*/, "", ts)
+    sid = ""; sig = p[2]
+    if (match(p[2], /^\[[0-9]+:[0-9]+:[0-9]+\]/)) {
+        split(substr(p[2], RSTART + 1, RLENGTH - 2), q, ":")
+        sid = q[2]
+        sig = substr(p[2], RLENGTH + 2)
+    }
+    pri = 3
+    if (match(p[3], /Priority: [0-9]+/)) pri = substr(p[3], RSTART + 10, RLENGTH - 10)
+    proto = ""; src = "?"; dst = "?"
+    if (match(p[3], /\{[A-Za-z0-9_]+\}/)) {
+        proto = substr(p[3], RSTART + 1, RLENGTH - 2)
+        rest = substr(p[3], RSTART + RLENGTH + 1)
+        if (split(rest, e, " -> ") == 2) { src = e[1]; dst = e[2] }
+    }
+    gsub(/[^ -~]/, "?", sig)
+    fpf = "-"
+    if (fp != "" && tolower($0) ~ tolower(fp)) fpf = "FP"
+    cls = "T"
+    if (toupper(sig) ~ /^ET INFO/ || (pri + 0) >= 3) cls = "I"
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", pri, ts, sid, sig, src, dst, proto, fpf, cls
+}
+EOF
+
+read -r -d '' AWK_ALERTS <<'EOF'
+BEGIN { FS = "\t"; label = toupper(label) }
+{
+    sev = $1 + 0; tm = $2; sid = $3; sig = $4; src = $5; dst = $6; proto = $7
+    fp = ($8 == "FP"); cls = $9
+    if (fp) { fpn++; if (fphide) next }
+    line = tm " "
+    if (fp) line = line "[" label "] "
+    line = line "S" sev " "
+    if (sid != "") line = line "[" sid "] "
+    line = line sig "  " proto " " src " -> " dst
+    if (length(line) > maxw) line = substr(line, 1, maxw - 3) "..."
+    if (cls == "I") {
+        if (fp) col = mag; else if (sev == 3) col = cyn; else col = dim
+        ln++; iq[ln] = col line rst
+    } else {
+        if (fp) col = mag; else if (sev == 1) col = red; else col = yel
+        hn++; hq[hn] = col line rst
+    }
+}
+END {
+    for (i = (hn > boxn ? hn - boxn + 1 : 1); i <= hn; i++) print "H\t" hq[i]
+    for (i = (ln > boxn ? ln - boxn + 1 : 1); i <= ln; i++) print "I\t" iq[i]
+    printf "C\t%d\t%d\t%d\n", hn + 0, ln + 0, fpn + 0
+}
+EOF
+
+# ------------------------------------------------------------------------------
+# TERMINAL CLEANUP & TRAPS
+# ------------------------------------------------------------------------------
+cleanup() {
+    if [ "$INTERACTIVE" = "1" ]; then
+        printf '\033[0m\033[?7h\033[?25h\033[?1049l'
+        [ -n "$STTY_SAVE" ] && stty "$STTY_SAVE" 2>/dev/null
+        printf '%s\n' "${GREEN}${BOLD}[+] Dashboard closed successfully.${NC}"
+    fi
+}
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap cleanup EXIT
+
+# ------------------------------------------------------------------------------
+# HELPERS
+# ------------------------------------------------------------------------------
+safe_int() {
+    if [[ "${1:-0}" =~ ^-?[0-9]+$ ]]; then printf '%s\n' "$1"; else printf '0\n'; fi
+}
+
+# Pure-bash formatters (no forks). Result in FMT_OUT.
+num_commas() {
+    local s="${1:-0}" neg="" out=""
+    [[ "$s" =~ ^-?[0-9]+$ ]] || { FMT_OUT="$s"; return; }
+    if [ "${s:0:1}" = "-" ]; then neg="-"; s="${s:1}"; fi
+    while [ "${#s}" -gt 3 ]; do
+        out=",${s: -3}${out}"
+        s="${s:0:${#s}-3}"
+    done
+    FMT_OUT="${neg}${s}${out}"
+}
+
+bytes_h() {
+    local b="${1:-0}" i=0 frac=0
+    local -a units=(B KiB MiB GiB TiB PiB)
+    [[ "$b" =~ ^[0-9]+$ ]] || b=0
+    while [ "$b" -ge 1024 ] && [ "$i" -lt 5 ]; do
+        frac=$(( (b % 1024) * 10 / 1024 ))
+        b=$(( b / 1024 ))
+        i=$(( i + 1 ))
+    done
+    if [ "$i" -eq 0 ]; then FMT_OUT="${b}B"; else FMT_OUT="${b}.${frac}${units[$i]}"; fi
+}
+
+fmt_num()   { num_commas "$1"; printf '%s' "$FMT_OUT"; }
+fmt_bytes() { bytes_h "$1";    printf '%s' "$FMT_OUT"; }
+
+fmt_uptime() {
+    local s
+    s="$(safe_int "$1")"
+    printf '%dd %02dh %02dm %02ds' $((s/86400)) $((s%86400/3600)) $((s%3600/60)) $((s%60))
+}
+
+get_now_ms() {
+    local t
+    if [ -n "${EPOCHREALTIME:-}" ]; then
+        t="${EPOCHREALTIME/[.,]/}"
+        t="${t%???}"
+        if [[ "$t" =~ ^[0-9]+$ ]]; then NOW_TS="$t"; return; fi
+    fi
+    t="$(date +%s%3N 2>/dev/null || true)"
+    [[ "$t" =~ ^[0-9]+$ ]] || t="$(date +%s)000"
+    NOW_TS="$t"
+}
+
+update_term_width() {
+    local w
+    w="$(tput cols 2>/dev/null || echo 100)"
+    [[ "$w" =~ ^[0-9]+$ ]] || w=100
+    [ "$w" -lt 96 ] && w=96
+    [ "$w" -gt 140 ] && w=140
+    TERM_W="$w"
+}
+
+sc_raw() {
+    local command="${1:-}"
+    [ -n "$command" ] || return 1
+    if [ -n "${SOCKET:-}" ]; then
+        suricatasc -c "$command" "$SOCKET" 2>/dev/null
+    else
+        suricatasc -c "$command" 2>/dev/null
+    fi
+}
+
+sc_json() {
+    local command="${1:-}" raw
+    [ -n "$command" ] || return 1
+    raw="$(sc_raw "$command")" || return 1
+    [ -n "$raw" ] || return 1
+    if printf '%s\n' "$raw" | jq -e . >/dev/null 2>&1; then
+        printf '%s\n' "$raw"
+        return 0
+    fi
+    # Older suricatasc builds print a python-style dict: convert it.
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s\n' "$raw" | python3 -c '
+import sys, json, ast
+data = sys.stdin.read().strip()
+try:
+    obj = json.loads(data)
+except Exception:
+    try:
+        obj = ast.literal_eval(data)
+    except Exception:
+        sys.exit(1)
+print(json.dumps(obj, separators=(",", ":")))
+' 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+# ------------------------------------------------------------------------------
+# SOCKET DISCOVERY
+# ------------------------------------------------------------------------------
+discover_socket() {
+    if [ -n "${SOCKET:-}" ]; then
+        if [ -S "$SOCKET" ] && suricatasc -c version "$SOCKET" >/dev/null 2>&1; then
+            SOCKET_STATUS="OK"; return 0
+        fi
+        SOCKET_STATUS="FAILED"; return 1
+    fi
+
+    if suricatasc -c version >/dev/null 2>&1; then
+        SOCKET=""; SOCKET_STATUS="OK"; return 0
+    fi
+
+    local candidates=(
+        "/run/suricata/suricata-command.socket"
+        "/var/run/suricata/suricata-command.socket"
+        "/run/suricata-command.socket"
+        "/var/run/suricata-command.socket"
+    )
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        [ -S "$candidate" ] || continue
+        if suricatasc -c version "$candidate" >/dev/null 2>&1; then
+            SOCKET="$candidate"; SOCKET_STATUS="OK"; return 0
+        fi
+    done
+
+    while IFS= read -r candidate; do
+        [ -S "$candidate" ] || continue
+        if suricatasc -c version "$candidate" >/dev/null 2>&1; then
+            SOCKET="$candidate"; SOCKET_STATUS="OK"; return 0
+        fi
+    done < <(find /run /var/run -type s \( -iname '*suricata*socket*' -o -iname '*command.socket' \) 2>/dev/null | head -n 20)
+
+    SOCKET_STATUS="FAILED"
+    return 1
+}
+
+get_suricata_version() {
+    local data value
+    data="$(sc_json version 2>/dev/null || true)"
+    [ -n "$data" ] || { SURICATA_VERSION="UNKNOWN"; return; }
+    value="$(printf '%s\n' "$data" | jq -r '
+        def unwrap: if type == "object" and has("message") then .message else . end;
+        unwrap |
+        if type == "string" then .
+        elif type == "object" then (.version // .suricata_version // .message // "UNKNOWN") | tostring
+        else "UNKNOWN" end' 2>/dev/null | head -n 1)"
+    SURICATA_VERSION="${value:-UNKNOWN}"
+    [ -n "$SURICATA_VERSION" ] || SURICATA_VERSION="UNKNOWN"
+}
+
+# ------------------------------------------------------------------------------
+# COUNTER PARSING
+# ------------------------------------------------------------------------------
+parse_counters() {
+    local line k rest v alt
+    while IFS= read -r line; do
+        k="${line%%=*}"
+        rest="${line#*=}"
+        v="${rest%%;*}"
+        alt="${rest#*;}"
+        [[ "$k" =~ ^[A-Z0-9_]+$ ]] || continue
+
+        if [ "$v" = "NA" ]; then
+            # Not exposed by this build: show n/a, keep numeric value at 0.
+            DV[$k]="n/a"; CTR_ALT[$k]="-"
+            continue
+        fi
+        if ! [[ "$v" =~ ^-?[0-9]+$ ]]; then
+            if [[ "$v" =~ ^-?[0-9.]+([eE][+-]?[0-9]+)?$ ]]; then
+                v="$(awk -v x="$v" 'BEGIN { printf "%.0f", x }')"
+            else
+                continue
+            fi
+        fi
+        printf -v "$k" '%s' "$v"
+        CTR_ALT[$k]="$alt"
+        case "$k" in
+            FLOW_MEM_USE|FRAG_MEM_USE|TCP_MEMUSE|TCP_REASM_MEM) bytes_h "$v" ;;
+            *) num_commas "$v" ;;
+        esac
+        DV[$k]="$FMT_OUT"
+    done < <(printf '%s\n' "$1" | jq -r --arg map "$MAP_STR" "$JQ_COUNTERS" 2>/dev/null)
+}
+
+dump_keys() {
+    printf '%s\n' "$1" | jq -r "$JQ_DUMP_KEYS" 2>/dev/null
+}
+
+check_report() {
+    local entry k found=0 missing=0
+    printf '%-20s %-18s %s\n' "COUNTER" "VALUE" "RESOLVED FROM"
+    printf '%-20s %-18s %s\n' "-------" "-----" "-------------"
+    for entry in "${COUNTER_MAP[@]}"; do
+        k="${entry%%:*}"
+        printf '%-20s %-18s %s\n' "$k" "${DV[$k]}" "${CTR_ALT[$k]}"
+        if [ "${DV[$k]}" = "n/a" ]; then missing=$((missing+1)); else found=$((found+1)); fi
+    done
+    printf '\n%s counters resolved, %s not exposed by this Suricata build/config.\n' "$found" "$missing"
+    printf 'n/a is normal for features you do not use (bypass, IPS verdicts, QUIC, ...).\n'
+    printf 'Run with --debug-counters to see every key your build really exposes.\n'
+}
+
+get_rules_loaded() {
+    local data value
+    data="$(sc_json ruleset-stats 2>/dev/null || true)"
+    if [ -n "$data" ]; then
+        value="$(printf '%s\n' "$data" | jq -r "$JQ_FIND_RULES" 2>/dev/null)"
+        if [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -gt 0 ]; then
+            RULES_CACHE="$value"; RULES_LOADED="$value"; return
+        fi
+    fi
+    if [ -n "$JSON_DATA" ]; then
+        value="$(printf '%s\n' "$JSON_DATA" | jq -r "$JQ_FIND_RULES" 2>/dev/null)"
+        if [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -gt 0 ]; then
+            RULES_CACHE="$value"; RULES_LOADED="$value"; return
+        fi
+    fi
+    RULES_LOADED="$RULES_CACHE"
+}
+
+sync_uptime() {
+    local data value
+    data="$(sc_json uptime 2>/dev/null || true)"
+    [ -n "$data" ] || return
+    value="$(printf '%s\n' "$data" | jq -r '
+        def unwrap: if type == "object" and has("message") then .message else . end;
+        unwrap |
+        if type == "number" then .
+        elif type == "string" then tonumber?
+        elif type == "object" then (.uptime? // .seconds? // .value?)
+        else null end' 2>/dev/null)"
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        UPTIME_BASE="$value"
+        UPTIME_BASE_TS="$NOW_TS"
+    fi
+}
+
+resolve_uptime() {
+    if [ "${UPTIME_C:-0}" -gt 0 ]; then
+        UPTIME="$UPTIME_C"
+    elif [ "$UPTIME_BASE_TS" -gt 0 ]; then
+        UPTIME=$(( UPTIME_BASE + (NOW_TS - UPTIME_BASE_TS) / 1000 ))
+    else
+        UPTIME="$UPTIME_BASE"
+    fi
+}
+
+get_other_protos() {
+    OTHER_PROTOS=""
+    [ -n "$JSON_DATA" ] || return
+    OTHER_PROTOS=$(printf '%s\n' "$JSON_DATA" | jq -r --argjson ex "$FIXED_PROTOS" '
+        (if has("message") then .message else . end)
+        | (.app_layer.flow // {}) | to_entries
+        | map(select((.value | type) == "number" and .value > 0
+                     and ((.key | IN($ex[])) | not)
+                     and ((.key | startswith("failed")) | not)))
+        | sort_by(-.value) | .[]
+        | "\(.key)\t\(.value | floor)"' 2>/dev/null)
+}
+
+show_other_protos() {
+    if [ -z "$OTHER_PROTOS" ]; then
+        printf '%s\n' "  ${DIM}(no uncommon protocols detected)${NC}"
+        return
+    fi
+    printf '%s\n' "$OTHER_PROTOS" | awk -F'\t' -v max=18 '
+        NF == 2 && n < max {
+            n++
+            if (n % 3 != 1) printf " |"
+            printf " %-11.11s : \033[36m%-8.0f\033[0m", $1, $2
+            if (n % 3 == 0) printf "\n"
+        }
+        NF == 2 { total++ }
+        END {
+            if (n > 0 && n % 3 != 0) printf "\n"
+            if (total > max) printf "  ... +%d more\n", total - max
+        }'
+}
+
+compute_effective() {
+    if [ "${PKTS:-0}" -gt 0 ]; then
+        EFF_PKTS="$PKTS"; PKT_SRC="decoder.pkts"
+    else
+        EFF_PKTS=$(( ${TCP_PKTS:-0} + ${UDP_PKTS:-0} + ${ICMP_PKTS:-0} + ${ARP_PKTS:-0} + ${IPV6_PKTS:-0} ))
+        PKT_SRC="proto-sum"
+    fi
+
+    if [ "${BYTES:-0}" -gt 0 ]; then
+        EFF_BYTES="$BYTES"; BYTE_SRC="decoder.bytes"
+    else
+        EFF_BYTES=0; BYTE_SRC="none"
+    fi
+
+    if [ "${TOTAL_FLOWS:-0}" -gt 0 ]; then
+        EFF_FLOWS="$TOTAL_FLOWS"; FLOW_SRC="flow.total"
+    else
+        EFF_FLOWS=$(( ${F_TCP:-0} + ${F_UDP:-0} ))
+        FLOW_SRC="flow.proto-sum"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# HEALTH ENGINE
+#   100% = fully healthy. Problems are detected from per-cycle DELTAS of the
+#   counters (lifetime totals never penalize) and stay active for
+#   HEALTH_HOLD_S seconds so a problem seen at one stats tick is visible for
+#   more than a single refresh. Recovery is automatic.
+# ------------------------------------------------------------------------------
+hp_bump() {   # name points text
+    HP_UNTIL[$1]=$(( NOW_TS + HEALTH_HOLD_S * 1000 ))
+    HP_PEN[$1]="$2"
+    HP_TXT[$1]="${3:-$1}"
+}
+
+hp_active() { [ "${HP_UNTIL[$1]:-0}" -gt "$NOW_TS" ]; }
+
+# True when counter $2 grew since the last call for key $1 (first call: false).
+delta_pos() {
+    local cur="${2:-0}" prev="${PH[$1]:-}"
+    PH[$1]="$cur"
+    [ -n "$prev" ] && [ "$cur" -gt "$prev" ]
+}
+
+compute_health() {
+    local score=100 reasons="" name pen pct dd dp
+
+    if [ "$SOCKET_STATUS" != "OK" ]; then
+        HEALTH_PCT=0; HEALTH_REASONS="socket-offline; "
+        return
+    fi
+
+    if [ "$PH_INIT" = "1" ]; then
+        dd=$(( KERNEL_DROPS - PH_KD ))
+        dp=$(( KERNEL_PKTS  - PH_KP ))
+        if [ "$dd" -gt 0 ]; then
+            read -r pen pct <<< "$(awk -v d="$dd" -v p="$dp" 'BEGIN {
+                pct = (p > 0) ? d * 100 / p : 100
+                if (pct > 100) pct = 100
+                pen = int(pct + 0.999) * 6
+                if (pen < 3) pen = 3
+                if (pen > 30) pen = 30
+                printf "%d %.2f", pen, pct }')"
+            DROP_PCT_NOW="$pct"
+            hp_bump capture-drop "$pen" "capture-drop ${pct}%"
+        fi
+    fi
+    PH_KD="$KERNEL_DROPS"; PH_KP="$KERNEL_PKTS"; PH_INIT=1
+
+    delta_pos flow-emergency       "$FLOW_EMERGENCY"  && hp_bump flow-emergency       20
+    delta_pos flow-memcap          "$FLOW_MEMCAP"     && hp_bump flow-memcap          10
+    delta_pos ssn-memcap-drop      "$MEMCAP_DROPS"    && hp_bump ssn-memcap-drop      10
+    delta_pos segment-memcap-drop  "$SEG_MEMCAP"      && hp_bump segment-memcap-drop   5
+    delta_pos frag-memcap          "$FRAG_MEMCAP"     && hp_bump frag-memcap           5
+    delta_pos alert-queue-overflow "$DETECT_QUEUE"    && hp_bump alert-queue-overflow  5
+    delta_pos app-layer-errors     "$AL_ERR"          && hp_bump app-layer-errors      3
+    delta_pos frag-timeouts        "$FRAG_TIMEOUTS"   && hp_bump frag-timeouts         2
+    delta_pos bad-checksums        "$TCP_BAD_CSUM"    && hp_bump bad-checksums         2
+
+    for name in "${HP_ORDER[@]}"; do
+        if hp_active "$name"; then
+            score=$(( score - ${HP_PEN[$name]:-0} ))
+            reasons+="${HP_TXT[$name]:-$name}; "
+        fi
+    done
+    if [ "$COUNTER_RESETS" -gt 0 ]; then
+        reasons+="counter-resets=${COUNTER_RESETS}; "
+    fi
+
+    [ "$score" -lt 0 ] && score=0
+    [ "$score" -gt 100 ] && score=100
+    HEALTH_PCT="$score"
+    HEALTH_REASONS="$reasons"
+}
+
+set_health_color() {
+    if [ "$HEALTH_PCT" -ge 90 ]; then HC="$GREEN"
+    elif [ "$HEALTH_PCT" -ge 60 ]; then HC="$YELLOW"
+    else HC="$RED"; fi
+}
+
+# ------------------------------------------------------------------------------
+# RATE ENGINE
+# ------------------------------------------------------------------------------
+# Rolling peak for auto-scaling bars: rises instantly, decays 3/4 per cycle.
+peak_roll() {   # $1 = current, $2 = peak, $3 = floor -> NEW_PEAK
+    local cur="$1" peak="$2" floor="$3"
+    if [ "$cur" -ge "$peak" ]; then
+        peak="$cur"
+    else
+        peak=$(( (peak * 3 + cur) / 4 ))
+        [ "$peak" -lt "$floor" ] && peak="$floor"
+        [ "$cur" -gt "$peak" ] && peak="$cur"
+    fi
+    NEW_PEAK="$peak"
+}
+
+# Live NIC totals from /proc/net/dev. Always up to date, regardless of how
+# often Suricata refreshes its stats snapshot.
+read_iface_stats() {
+    awk -v inc="$NIC_IFACES" '
+        BEGIN { n = split(inc, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+        NR > 2 {
+            line = $0; sub(/^[ \t]+/, "", line)
+            name = line; sub(/:.*/, "", name)
+            sub(/^[^:]*:/, "", line)
+            split(line, f, " ")
+            if (name == "lo") next
+            if (n > 0 && !(name in want)) next
+            if (n == 0 && name ~ /^(docker|veth|virbr|br-)/) next
+            p += f[2] + f[10]; b += f[1] + f[9]
+        }
+        END { printf "%.0f %.0f\n", p, b }' /proc/net/dev 2>/dev/null || echo "0 0"
+}
+
+calculate_all_rates() {
+    local changed=0 dt out np nm pr mb elapsed
+
+    [ -r /proc/net/dev ] && NIC_OK=1 || NIC_OK=0
+    read -r NIC_PKTS NIC_BYTES <<< "$(read_iface_stats)"
+    NIC_PKTS="$(safe_int "$NIC_PKTS")"; NIC_BYTES="$(safe_int "$NIC_BYTES")"
+
+    # ---- socket snapshot: did Suricata publish new numbers? -----------------
+    if [ "$SNAP_TS" -eq 0 ]; then
+        SNAP_TS="$NOW_TS"
+    elif [ "$EFF_PKTS" -lt "$SNAP_PKTS" ] || [ "${ALERTS:-0}" -lt "$SNAP_ALERTS" ] \
+         || [ "$PKT_SRC" != "$SNAP_PKT_SRC" ]; then
+        COUNTER_RESETS=$(( COUNTER_RESETS + 1 ))     # restart / source change
+        SNAP_TS="$NOW_TS"
+    elif [ "$EFF_PKTS" != "$SNAP_PKTS" ] || [ "$EFF_BYTES" != "$SNAP_BYTES" ] \
+         || [ "$EFF_FLOWS" != "$SNAP_FLOWS" ] || [ "${ALERTS:-0}" != "$SNAP_ALERTS" ] \
+         || [ "${KERNEL_DROPS:-0}" != "$SNAP_DROPS" ]; then
+        changed=1
+    fi
+
+    if [ "$changed" -eq 1 ]; then
+        dt=$(( NOW_TS - SNAP_TS )); [ "$dt" -lt 1 ] && dt=1
+        out="$(awk -v ms="$dt" \
+            -v cp="$EFF_PKTS"  -v pp="$SNAP_PKTS" \
+            -v cb="$EFF_BYTES" -v pb="$SNAP_BYTES" \
+            -v cf="$EFF_FLOWS" -v pf="$SNAP_FLOWS" \
+            -v ca="${ALERTS:-0}"       -v pa="$SNAP_ALERTS" \
+            -v cd="${KERNEL_DROPS:-0}" -v pd="$SNAP_DROPS" '
+            function r(c, p,   d) { d = c - p; return (d < 0) ? 0 : d / s }
+            BEGIN {
+                s = ms / 1000; if (s <= 0) s = 1
+                printf "%.2f %.2f %.2f %.2f %.2f\n", r(cp, pp), r(cb, pb) * 8 / 1000000, \
+                    r(cd, pd), r(ca, pa), r(cf, pf)
+            }' 2>/dev/null)"
+        if [ -n "$out" ]; then
+            read -r SOCK_PPS SOCK_MBIT SOCK_DROPS SOCK_ALERTS SOCK_FLOWS <<< "$out"
+        fi
+        SOCK_UNTIL=$(( NOW_TS + 2 * dt + 1000 ))
+        SNAP_TS="$NOW_TS"
+    fi
+    SNAP_PKTS="$EFF_PKTS"; SNAP_BYTES="$EFF_BYTES"; SNAP_FLOWS="$EFF_FLOWS"
+    SNAP_ALERTS="${ALERTS:-0}"; SNAP_DROPS="${KERNEL_DROPS:-0}"; SNAP_PKT_SRC="$PKT_SRC"
+
+    # Alerts / drops / flows rates: held until the next snapshot, then decay.
+    if [ "$NOW_TS" -le "$SOCK_UNTIL" ]; then
+        ALERT_RATE="$SOCK_ALERTS"; DROP_RATE="$SOCK_DROPS"; FLOW_RATE="$SOCK_FLOWS"
+    else
+        ALERT_RATE="0.00"; DROP_RATE="0.00"; FLOW_RATE="0.00"
+    fi
+
+    # ---- pps / Mbit/s: fresh socket data, else live NIC counters -----------
+    RATE_SRC="socket"
+    PKT_RATE="0.00"; MBIT_RATE="0.00"
+    if [ "$changed" -eq 1 ] && awk -v a="$SOCK_PPS" -v b="$SOCK_MBIT" 'BEGIN { exit !(a+0 > 0 || b+0 > 0) }'; then
+        PKT_RATE="$SOCK_PPS"; MBIT_RATE="$SOCK_MBIT"
+    elif [ "$NIC_SEEN" -eq 1 ] && [ "$NIC_OK" -eq 1 ]; then
+        elapsed=$(( NOW_TS - PREV_TS )); [ "$elapsed" -lt 50 ] && elapsed=1000
+        out="$(awk -v ms="$elapsed" -v cp="$NIC_PKTS" -v pp="$NIC_PREV_PKTS" \
+                   -v cb="$NIC_BYTES" -v pb="$NIC_PREV_BYTES" 'BEGIN {
+            s = ms / 1000; if (s <= 0) s = 1
+            dp = cp - pp; db = cb - pb
+            if (dp < 0) dp = 0
+            if (db < 0) db = 0
+            printf "%.2f %.2f\n", dp / s, db * 8 / 1000000 / s }')"
+        read -r np nm <<< "$out"
+        PKT_RATE="${np:-0.00}"; MBIT_RATE="${nm:-0.00}"
+        RATE_SRC="nic (/proc/net/dev)"
+    elif [ "$NOW_TS" -le "$SOCK_UNTIL" ]; then
+        PKT_RATE="$SOCK_PPS"; MBIT_RATE="$SOCK_MBIT"; RATE_SRC="socket (held)"
+    fi
+    NIC_PREV_PKTS="$NIC_PKTS"; NIC_PREV_BYTES="$NIC_BYTES"; NIC_SEEN=1
+
+    if [ "${DEBUG_RATES:-0}" = "1" ]; then
+        printf 'DEBUG changed=%s pkts=%s bytes=%s nic=%s/%s => pps=%s mbit=%s src=%s\n' \
+            "$changed" "$EFF_PKTS" "$EFF_BYTES" "$NIC_PKTS" "$NIC_BYTES" \
+            "$PKT_RATE" "$MBIT_RATE" "$RATE_SRC" >&2
+    fi
+
+    # Rolling peaks (hundredths) drive the auto-scaling bars.
+    pr=$(( 10#${PKT_RATE/./} ))
+    peak_roll "$pr" "$PEAK" 1;    PEAK="$NEW_PEAK"
+    mb=$(( 10#${MBIT_RATE/./} ))
+    peak_roll "$mb" "$PEAK_MB" 1; PEAK_MB="$NEW_PEAK"
+
+    PREV_TS="$NOW_TS"
+}
+
+make_graph() {
+    local val=$1 peak=$2 bars
+    [ "$peak" -lt 1 ] && peak=1
+    [ "$val" -lt 0 ] && val=0
+    bars=$(( (val * GRAPH_MAX + peak / 2) / peak ))
+    [ "$bars" -gt "$GRAPH_MAX" ] && bars=$GRAPH_MAX
+    [ "$val" -gt 0 ] && [ "$bars" -lt 1 ] && bars=1
+    printf '%s' "${BLOCK40:0:bars}${EMPTY40:0:GRAPH_MAX-bars}"
+}
+
+hund() { printf '%d.%02d' $(( $1 / 100 )) $(( $1 % 100 )); }
+
+# Lifetime kernel drop ratio (informational). n/a if the capture method has no
+# capture.* counters (e.g. NFQ).
+kernel_drop_percent() {
+    if [ "${DV[KERNEL_PKTS]}" = "n/a" ]; then printf 'n/a'; return; fi
+    awk -v packets="${KERNEL_PKTS:-0}" -v drops="${KERNEL_DROPS:-0}" 'BEGIN {
+        if (packets <= 0) { printf "0.00%%"; exit }
+        p = (drops / packets) * 100
+        if (p < 0) p = 0
+        if (p > 100) p = 100
+        printf "%.2f%%", p
+    }'
+}
+
+alert_ratio() {
+    awk -v packets="${EFF_PKTS:-0}" -v alerts="${ALERTS:-0}" 'BEGIN {
+        if (packets <= 0) { printf "0.000%%"; exit }
+        printf "%.3f%%", (alerts / packets) * 100
+    }'
+}
+
+# ------------------------------------------------------------------------------
+# EVE COLLECTION
+# ------------------------------------------------------------------------------
+collect_eve_stats() {
+    local lines="${1:-$EVE_SAMPLE_LINES}"
+    local line tag rest count name
+
+    EVE_EVENTS=0; EVE_THREATS=0; EVE_INFO=0
+    EVE_UNIQUE_SIGS=0; EVE_UNIQUE_SRC=0; EVE_UNIQUE_DST=0
+    EVE_SEV1=0; EVE_SEV2=0; EVE_SEV3=0; EVE_SEV4=0; EVE_ANOMALY=0
+    EVE_HTTP=0; EVE_TLS=0; EVE_DNS=0; EVE_FLOWS=0
+    TOP_SIGS=""; TOP_SRC=""; TOP_DST=""; TOP_CATS=""; TOP_ISIGS=""
+    TOP_HTTP=""; TOP_TLS=""; TOP_DNS=""
+
+    [ -f "$EVE_LOG" ] || return 0
+
+    EVE_DISPLAY_BYTES="$(stat -c '%s' "$EVE_LOG" 2>/dev/null || echo 0)"
+
+    while IFS= read -r line; do
+        tag="${line%%[ $'\t']*}"
+        case "$tag" in
+            AGG)
+                rest="${line#* }"
+                read -r EVE_EVENTS EVE_THREATS EVE_INFO EVE_UNIQUE_SIGS EVE_UNIQUE_SRC EVE_UNIQUE_DST \
+                    EVE_SEV1 EVE_SEV2 EVE_SEV3 EVE_SEV4 EVE_ANOMALY EVE_HTTP EVE_TLS EVE_DNS EVE_FLOWS \
+                    <<< "$rest"
+                ;;
+            SIG|SRC|DST|CAT|ISIG|HTTP|TLS|DNS)
+                rest="${line#*$'\t'}"
+                count="${rest%%$'\t'*}"
+                name="${rest#*$'\t'}"
+                case "$tag" in
+                    SIG)  TOP_SIGS+="$count  $name"$'\n' ;;
+                    SRC)  TOP_SRC+="$count  $name"$'\n' ;;
+                    DST)  TOP_DST+="$count  $name"$'\n' ;;
+                    CAT)  TOP_CATS+="$count  $name"$'\n' ;;
+                    ISIG) TOP_ISIGS+="$count  $name"$'\n' ;;
+                    HTTP) TOP_HTTP+="$count  $name"$'\n' ;;
+                    TLS)  TOP_TLS+="$count  $name"$'\n' ;;
+                    DNS)  TOP_DNS+="$count  $name"$'\n' ;;
+                esac
+                ;;
+        esac
+    done < <(tail -n "$lines" "$EVE_LOG" 2>/dev/null \
+             | jq -R -r "$JQ_EVE_STREAM" 2>/dev/null \
+             | awk -F'\t' "$AWK_EVE_AGG" 2>/dev/null)
+
+    EVE_EVENTS="$(safe_int "$EVE_EVENTS")"
+    EVE_THREATS="$(safe_int "$EVE_THREATS")"
+    EVE_INFO="$(safe_int "$EVE_INFO")"
+    EVE_UNIQUE_SIGS="$(safe_int "$EVE_UNIQUE_SIGS")"
+    EVE_UNIQUE_SRC="$(safe_int "$EVE_UNIQUE_SRC")"
+    EVE_UNIQUE_DST="$(safe_int "$EVE_UNIQUE_DST")"
+    EVE_SEV1="$(safe_int "$EVE_SEV1")"
+    EVE_SEV2="$(safe_int "$EVE_SEV2")"
+    EVE_SEV3="$(safe_int "$EVE_SEV3")"
+    EVE_SEV4="$(safe_int "$EVE_SEV4")"
+    EVE_ANOMALY="$(safe_int "$EVE_ANOMALY")"
+    EVE_HTTP="$(safe_int "$EVE_HTTP")"
+    EVE_TLS="$(safe_int "$EVE_TLS")"
+    EVE_DNS="$(safe_int "$EVE_DNS")"
+    EVE_FLOWS="$(safe_int "$EVE_FLOWS")"
+}
+
+# ------------------------------------------------------------------------------
+# ALERT COLLECTION
+# ------------------------------------------------------------------------------
+collect_recent_alerts() {
+    local tsv="" line tag rest
+    local c_red c_yel c_cyn c_mag c_dim c_rst maxw
+
+    ALERT_HI=""; ALERT_INFO=""; CNT_HI=0; CNT_INFO=0; CNT_FP=0
+
+    if [ -s "$EVE_LOG" ]; then
+        tsv="$(tail -n "$ALERT_SCAN_LINES" "$EVE_LOG" 2>/dev/null \
+               | grep -E '"event_type" *: *"alert"' \
+               | tail -n "$ALERT_MAX_SCAN" \
+               | jq -R -r --arg fp "$FP_REGEX" "$JQ_ALERT_TSV" 2>/dev/null)"
+    fi
+    if [ -z "$tsv" ] && [ -s "$FAST_LOG" ]; then
+        tsv="$(tail -n "$ALERT_MAX_SCAN" "$FAST_LOG" 2>/dev/null \
+               | awk -v fp="$FP_REGEX" "$AWK_FASTLOG" 2>/dev/null)"
+    fi
+    [ -n "$tsv" ] || return 0
+
+    c_red=$'\033[1;31m'; c_yel=$'\033[33m'; c_cyn=$'\033[36m'
+    c_mag=$'\033[35m';   c_dim=$'\033[2m';  c_rst=$'\033[0m'
+    maxw=$(( TERM_W - 4 ))
+
+    while IFS= read -r line; do
+        tag="${line%%$'\t'*}"
+        rest="${line#*$'\t'}"
+        case "$tag" in
+            H) ALERT_HI+="$rest"$'\n' ;;
+            I) ALERT_INFO+="$rest"$'\n' ;;
+            C) IFS=$'\t' read -r CNT_HI CNT_INFO CNT_FP <<< "$rest" ;;
+        esac
+    done < <(printf '%s\n' "$tsv" | awk -F'\t' \
+                -v boxn="$ALERT_BOX_LINES" -v maxw="$maxw" \
+                -v fphide="$FP_HIDE" -v label="$FP_LABEL" \
+                -v red="$c_red" -v yel="$c_yel" -v cyn="$c_cyn" \
+                -v mag="$c_mag" -v dim="$c_dim" -v rst="$c_rst" \
+                "$AWK_ALERTS" 2>/dev/null)
+
+    CNT_HI="$(safe_int "$CNT_HI")"
+    CNT_INFO="$(safe_int "$CNT_INFO")"
+    CNT_FP="$(safe_int "$CNT_FP")"
+}
+
+# ------------------------------------------------------------------------------
+# DISPLAY HELPERS  (printf '%s' everywhere: data is never interpreted)
+# ------------------------------------------------------------------------------
+# row "Label:" "value" "$COLOR"  [x3]   -> one aligned line of up to 3 cells
+row() {
+    local out="" piece
+    while [ $# -ge 3 ]; do
+        printf -v piece '%s%-15s%s%-15s%s' "$WHITE" "$1" "$3" "$2" "$NC"
+        out+="$piece"
+        shift 3
+    done
+    printf '  %s\n' "$out"
+}
+
+section() { printf '\n%s\n' "${MAGENTA}${BOLD}  [ $1 ]${NC}"; }
+
+print_top_list() {
+    local data="${1:-}" empty_msg="${2:-(no data in current EVE sample)}" line
+    if [ -n "$data" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            printf '    %s\n' "$line"
+        done <<< "$data"
+    else
+        printf '    %s\n' "${DIM}${empty_msg}${NC}"
+    fi
+}
+
+show_alert_box() {
+    local title="$1" color="$2" data="$3" empty_msg="$4"
+    local width fill line
+    width=$(( TERM_W - 5 - ${#title} ))
+    [ "$width" -lt 3 ] && width=3
+    printf -v fill '%*s' "$width" ''
+    fill="${fill// /─}"
+    printf '%s\n' "${color}${BOLD}┌─ ${title} ${fill}${NC}"
+    if [ -n "$data" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            printf '%s\n' "${color}│${NC} ${line}${NC}"
+        done <<< "$data"
+    else
+        printf '%s\n' "${color}│${NC} ${DIM}${empty_msg}${NC}"
+    fi
+    printf -v fill '%*s' "$(( TERM_W - 2 ))" ''
+    fill="${fill// /─}"
+    printf '%s\n' "${color}└${fill}${NC}"
+}
+
+show_alert_boxes() {
+    local fp_note=""
+    if [ "$CNT_FP" -gt 0 ]; then
+        fp_note=" | ${FP_LABEL^^} tagged: ${CNT_FP}$([ "$FP_HIDE" = "1" ] && echo ' (hidden)')"
+    fi
+
+    printf '%s\n' "${CYAN}${BOLD}[+] Realtime Alert Monitor (last ${ALERT_MAX_SCAN} alert events scanned${fp_note})${NC}"
+
+    if [ -n "$ALERT_HI" ]; then
+        show_alert_box "REAL THREATS - MEDIUM / HIGH  (${CNT_HI} in window)" "$RED" "$ALERT_HI" ""
+    else
+        printf '%s\n' "${GREEN}${BOLD}  ✔ No medium/high threats in the recent window${NC}"
+    fi
+}
+
+show_info_box() {
+    printf '\n'
+    show_alert_box "ET INFORMATIONAL / LOW  (${CNT_INFO} in window)" \
+        "$CYAN" "$ALERT_INFO" "(no informational alerts in the recent window)"
+}
+
+show_eve_stats() {
+    local eve_size
+
+    bytes_h "${EVE_DISPLAY_BYTES:-0}"; eve_size="$FMT_OUT"
+
+    printf '%s\n' "${MAGENTA}${BOLD}  [ EVE / THREAT CONTEXT - LAST ${EVE_DISPLAY_SAMPLE} LINES ]${NC}"
+    if [ ! -f "$EVE_LOG" ]; then
+        printf '  %s\n' "${YELLOW}EVE log not found: ${EVE_LOG}${NC}"
+    fi
+    printf "  ${WHITE}Events: ${CYAN}%-8d${NC}${WHITE}Threats: ${RED}%-7d${NC}${WHITE}Info: ${CYAN}%-8d${NC}${WHITE}Uniq sigs: ${CYAN}%-6d${NC}${WHITE}Uniq src: ${CYAN}%-6d${NC}${WHITE}Uniq dst: ${CYAN}%-6d${NC}\n" \
+        "$EVE_EVENTS" "$EVE_THREATS" "$EVE_INFO" "$EVE_UNIQUE_SIGS" "$EVE_UNIQUE_SRC" "$EVE_UNIQUE_DST"
+    printf "  ${WHITE}Sev1: ${RED}%-8d${NC}${WHITE}Sev2: ${YELLOW}%-10d${NC}${WHITE}Sev3: ${CYAN}%-8d${NC}${WHITE}Sev4/Info: ${CYAN}%-9d${NC}${WHITE}Anomalies: ${YELLOW}%-8d${NC}\n" \
+        "$EVE_SEV1" "$EVE_SEV2" "$EVE_SEV3" "$EVE_SEV4" "$EVE_ANOMALY"
+    printf "  ${WHITE}HTTP: ${CYAN}%-8d${NC}${WHITE}TLS: ${CYAN}%-11d${NC}${WHITE}DNS: ${CYAN}%-9d${NC}${WHITE}Flows: ${CYAN}%-11d${NC}${WHITE}EVE size: ${CYAN}%-10s${NC}\n" \
+        "$EVE_HTTP" "$EVE_TLS" "$EVE_DNS" "$EVE_FLOWS" "$eve_size"
+    printf '\n'
+
+    printf '%s\n' "  ${RED}${BOLD}Top THREAT signatures (medium/high):${NC}"
+    print_top_list "$TOP_SIGS" "(no medium/high threats in current EVE sample)"
+    printf '%s\n' "  ${RED}${BOLD}Top THREAT sources:${NC}";       print_top_list "$TOP_SRC" "(none)"
+    printf '%s\n' "  ${RED}${BOLD}Top THREAT destinations:${NC}";  print_top_list "$TOP_DST" "(none)"
+    printf '%s\n' "  ${RED}${BOLD}Top THREAT categories:${NC}";    print_top_list "$TOP_CATS" "(none)"
+    printf '\n'
+    printf '%s\n' "  ${CYAN}${BOLD}Top ET INFORMATIONAL signatures:${NC}"
+    print_top_list "$TOP_ISIGS" "(no informational alerts in current EVE sample)"
+    printf '\n'
+    printf '%s\n' "  ${BOLD}${WHITE}Top HTTP hosts:${NC}";  print_top_list "$TOP_HTTP"
+    printf '%s\n' "  ${BOLD}${WHITE}Top TLS SNI:${NC}";     print_top_list "$TOP_TLS"
+    printf '%s\n' "  ${BOLD}${WHITE}Top DNS names:${NC}";   print_top_list "$TOP_DNS"
+
+    show_info_box
+}
+
+show_health() {
+    local status="OK" status_color="$GREEN" ver
+    set_health_color
+
+    if [ "$SOCKET_STATUS" != "OK" ]; then
+        status="SOCKET OFFLINE"; status_color="$RED"
+    elif hp_active capture-drop; then
+        status="CAPTURE DROPS"; status_color="$YELLOW"
+    elif hp_active alert-queue-overflow; then
+        status="ALERT QUEUE BUSY"; status_color="$YELLOW"
+    elif [ "$HEALTH_PCT" -lt 90 ]; then
+        status="DEGRADED"; status_color="$YELLOW"
+    fi
+    ver="${SURICATA_VERSION:0:14}"
+
+    section "SENSOR HEALTH"
+    row "Health:" "${HEALTH_PCT}% $status" "$HC${BOLD}" \
+        "Socket:" "$SOCKET_STATUS" "$CYAN" \
+        "Rate source:" "${RATE_SRC:0:14}" "$DIM"
+    row "Suricata:" "$ver" "$CYAN" \
+        "Alert queue:" "${DV[DETECT_QUEUE]}" "$CYAN" \
+        "Alert/pkt:" "$(alert_ratio)" "$CYAN"
+    row "Uptime:" "$(fmt_uptime "$UPTIME")" "$CYAN" \
+        "Flows active:" "${DV[ACTIVE_FLOWS]}" "$CYAN" \
+        "Total alerts:" "${DV[ALERTS]}" "$CYAN"
+    if [ -n "$HEALTH_REASONS" ]; then
+        printf '  %s%-16s %s%s%s\n' "$WHITE" "Reasons:" "$YELLOW" "$HEALTH_REASONS" "$NC"
+    else
+        printf '  %s%-16s %s%s%s\n' "$WHITE" "Reasons:" "$GREEN" "none - all systems nominal" "$NC"
+    fi
+    row "Flow memcap:" "${DV[FLOW_MEMCAP]}" "$YELLOW" \
+        "Flow mem use:" "${DV[FLOW_MEM_USE]}" "$CYAN" \
+        "Flow emerg.:" "${DV[FLOW_EMERGENCY]}" "$YELLOW"
+    row "Frag memcap:" "${DV[FRAG_MEMCAP]}" "$CYAN" \
+        "Frag mem use:" "${DV[FRAG_MEM_USE]}" "$CYAN" \
+        "App-layer err:" "${DV[AL_ERR]}" "$CYAN"
+    row "Drop ratio:" "$(kernel_drop_percent)" "$YELLOW" \
+        "Last drop %:" "${DROP_PCT_NOW}%" "$YELLOW" \
+        "Resets:" "$COUNTER_RESETS" "$CYAN"
+    row "Load:" "$LOAD_LABEL" "$CYAN" \
+        "Refresh:" "${REFRESH_INTERVAL}s" "$CYAN" \
+        "Health hold:" "${HEALTH_HOLD_S}s" "$CYAN"
+}
+
+# ------------------------------------------------------------------------------
+# CONNECTION ERROR
+# ------------------------------------------------------------------------------
+show_connection_error() {
+    local rule
+    printf -v rule '%*s' "$TERM_W" ''; rule="${rule// /=}"
+    printf '%s\n' "${RED}${BOLD}${rule}${NC}"
+    printf '%s\n' "${RED}${BOLD}               SURICATA IPS DASHBOARD [CRITICAL ERROR]${NC}"
+    printf '%s\n' "${RED}${BOLD}${rule}${NC}"
+    printf '%s\n' "${YELLOW}[!] Unable to connect to the Suricata socket.${NC}"
+    printf '%s\n' "    Make sure Suricata is running in IPS/IDS mode with the unix-command socket enabled."
+    printf '%s\n' "    Socket status: ${WHITE}${SOCKET_STATUS:-UNKNOWN}${NC}"
+    if [ -n "${SOCKET:-}" ]; then
+        printf '%s\n' "    Socket path:   ${WHITE}${SOCKET}${NC}"
+    else
+        printf '%s\n' "    Socket path:   ${WHITE}default / auto-discovery${NC}"
+    fi
+    printf '%s\n' "----------------------------------------------------------------------"
+    printf '%s\n' "${CYAN}[+] Diagnostics:${NC}"
+    printf '%s\n' "  1. sudo systemctl status suricata --no-pager"
+    printf '%s\n' "  2. sudo suricatasc -c version"
+    printf '%s\n' "  3. sudo find /run /var/run -type s -iname '*suricata*' 2>/dev/null"
+    printf '%s\n' "  4. sudo ls -lh ${EVE_LOG}"
+    printf '%s\n' "  5. sudo journalctl -u suricata -n 50 --no-pager"
+    printf '%s\n' "----------------------------------------------------------------------"
+    printf '%s\n' "${CYAN}[+] Realtime Fast-Log Audit (last 10 alerts):${NC}"
+    if [ -f "$FAST_LOG" ]; then
+        tail -n 10 "$FAST_LOG" | sed -e 's/\x1b\[[0-9;]*m//g' | tr -cd '\11\12\15\40-\176'
+    else
+        printf '%s\n' "${RED}[-] No fast.log found at $FAST_LOG${NC}"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# FRAME RENDERING
+# ------------------------------------------------------------------------------
+render_frame() {
+    local rule rule_dash title pad_l pad_r pkt_bar mb_bar pk_peak mb_peak
+    local status_txt rules_txt bw_ok=1 mbit_disp eff_pk eff_by
+    local inspect="OK"
+
+    set_health_color
+    printf -v rule '%*s' "$TERM_W" ''
+    rule_dash="${rule// /-}"
+    rule="${rule// /=}"
+
+    title="sl0ppy SURICATA HARDENED IPS DASHBOARD"
+    pad_l=$(( (TERM_W - ${#title}) / 2 ))
+    pad_r=$(( TERM_W - ${#title} - pad_l ))
+
+    [ "$SOCKET_STATUS" = "OK" ] && status_txt="ACTIVE" || status_txt="OFFLINE"
+    if [ "$RULES_LOADED" -gt 0 ]; then rules_txt="$RULES_LOADED"; else rules_txt="n/a"; fi
+    [ "$HEALTH_PCT" -ge 90 ] || inspect="CHECK"
+    pk_peak="$(hund "$PEAK")"; mb_peak="$(hund "$PEAK_MB")"
+    num_commas "$EFF_PKTS"; eff_pk="$FMT_OUT"
+    if [ "$BYTE_SRC" = "none" ]; then eff_by="n/a"; else bytes_h "$EFF_BYTES"; eff_by="$FMT_OUT"; fi
+    if [ "$BYTE_SRC" = "none" ] && [ "$NIC_OK" -eq 0 ]; then bw_ok=0; fi
+    if [ "$bw_ok" -eq 1 ]; then mbit_disp="$MBIT_RATE"; else mbit_disp="n/a"; fi
+
+    printf '%s\n' "${BLUE}${BOLD}${rule}${NC}"
+    printf '%s%*s%s%*s%s\n' "${BG_BLUE}${WHITE}${BOLD}" "$pad_l" "" "$title" "$pad_r" "" "$NC"
+    printf '%s\n' "${BLUE}${BOLD}${rule}${NC}"
+
+    row "Status:" "$status_txt" "$GREEN" \
+        "Uptime:" "$(fmt_uptime "$UPTIME")" "$CYAN" \
+        "Rules active:" "$rules_txt" "$YELLOW"
+    row "Pps:" "$PKT_RATE" "$GREEN" \
+        "Mbit/s:" "$mbit_disp" "$CYAN" \
+        "Drops/s:" "$DROP_RATE" "$YELLOW"
+    row "Health:" "${HEALTH_PCT}%" "$HC${BOLD}" \
+        "Peak pps:" "$pk_peak" "$CYAN" \
+        "Peak Mbit/s:" "$mb_peak" "$CYAN"
+    row "Alerts/s:" "$ALERT_RATE" "$RED" \
+        "New flows/s:" "$FLOW_RATE" "$CYAN" \
+        "Rate source:" "${RATE_SRC:0:14}" "$DIM"
+    row "Suricata:" "${SURICATA_VERSION:0:14}" "$CYAN" \
+        "Suridash:" "$Suridash_Version" "$CYAN" \
+        "Refresh:" "${REFRESH_INTERVAL}s" "$CYAN"
+    printf '%s\n' "${BLUE}${BOLD}${rule_dash}${NC}"
+
+    # ---- Traffic graphs (auto-scaling bars) ----
+    pkt_bar=$(( 10#${PKT_RATE/./} ))
+    printf '%s\n' "${WHITE}  Packet rate (auto-scale, peak: ${pk_peak} pps):${NC}"
+    printf '  %s%s%s  %s%s pps%s\n' "$GREEN" "$(make_graph "$pkt_bar" "$PEAK")" "$NC" "$CYAN" "$PKT_RATE" "$NC"
+    if [ "$bw_ok" -eq 0 ]; then
+        printf '%s\n' "${WHITE}  Bandwidth:${NC} ${DIM}no byte counter available (Suricata decoder.bytes / NIC)${NC}"
+    else
+        mb_bar=$(( 10#${MBIT_RATE/./} ))
+        printf '%s\n' "${WHITE}  Bandwidth (auto-scale, peak: ${mb_peak} Mbit/s):${NC}"
+        printf '  %s%s%s  %s%s Mbit/s%s\n' "$YELLOW" "$(make_graph "$mb_bar" "$PEAK_MB")" "$NC" "$CYAN" "$MBIT_RATE" "$NC"
+    fi
+
+    section "DECODER & CAPTURE"
+    row "Packets:" "$eff_pk" "$CYAN" "Bytes:" "$eff_by" "$CYAN" "Invalid:" "${DV[DEC_INVALID]}" "$YELLOW"
+    row "IPv4:" "${DV[IPV4_PKTS]}" "$CYAN" "IPv6:" "${DV[IPV6_PKTS]}" "$CYAN" "ARP:" "${DV[ARP_PKTS]}" "$CYAN"
+    row "TCP pkts:" "${DV[TCP_PKTS]}" "$CYAN" "UDP pkts:" "${DV[UDP_PKTS]}" "$CYAN" "ICMP pkts:" "${DV[ICMP_PKTS]}" "$CYAN"
+    row "Kernel pkts:" "${DV[KERNEL_PKTS]}" "$CYAN" "Kernel drops:" "${DV[KERNEL_DROPS]}" "$YELLOW" "IF drops:" "${DV[KERNEL_IFDROPS]}" "$YELLOW"
+    row "Avg pkt size:" "${DV[AVG_PKT]}" "$CYAN" "Max pkt size:" "${DV[MAX_PKT]}" "$CYAN" "Drop ratio:" "$(kernel_drop_percent)" "$YELLOW"
+
+    section "FLOW & TCP"
+    row "Flows active:" "${DV[ACTIVE_FLOWS]}" "$CYAN" "Flows total:" "${DV[TOTAL_FLOWS]}" "$CYAN" "TCP flows:" "${DV[F_TCP]}" "$CYAN"
+    row "UDP flows:" "${DV[F_UDP]}" "$CYAN" "ICMPv4 flows:" "${DV[F_ICMP4]}" "$CYAN" "ICMPv6 flows:" "${DV[F_ICMP6]}" "$CYAN"
+    row "Ended new:" "${DV[END_NEW]}" "$CYAN" "Ended est.:" "${DV[END_EST]}" "$CYAN" "Ended closed:" "${DV[END_CLOSED]}" "$CYAN"
+    row "Flow memcap:" "${DV[FLOW_MEMCAP]}" "$YELLOW" "Flow emerg.:" "${DV[FLOW_EMERGENCY]}" "$YELLOW" "Wrong thread:" "${DV[FLOW_WRONG_THR]}" "$YELLOW"
+    row "TCP SYN:" "${DV[TCP_SYN]}" "$CYAN" "TCP SYNACK:" "${DV[TCP_SYNACK]}" "$CYAN" "TCP RST:" "${DV[TCP_RST]}" "$CYAN"
+    row "TCP active:" "${DV[TCP_ACTIVE]}" "$CYAN" "TCP sessions:" "${DV[TCP_SESS]}" "$CYAN" "Midstream:" "${DV[STREAM_MIDSTREAM]}" "$CYAN"
+    row "SSN drop:" "${DV[MEMCAP_DROPS]}" "$YELLOW" "Segment drop:" "${DV[SEG_MEMCAP]}" "$YELLOW" "Seg. cache:" "${DV[SEG_CACHE]}" "$CYAN"
+    row "TCP mem:" "${DV[TCP_MEMUSE]}" "$CYAN" "Reasm. mem:" "${DV[TCP_REASM_MEM]}" "$CYAN" "Reasm. gaps:" "${DV[TCP_REASM_GAP]}" "$YELLOW"
+
+    section "IPS & FLOW BYPASS"
+    row "Accepted:" "${DV[IPS_ACCEPTED]}" "$GREEN" "Blocked:" "${DV[IPS_BLOCKED]}" "$RED" "Rejected:" "${DV[IPS_REJECTED]}" "$RED"
+    row "Replaced:" "${DV[IPS_REPLACED]}" "$CYAN" "DPI Engine:" "${DPI_STATUS:-Enabled}" "$CYAN" "Flow evicted:" "${DV[FLOW_EVICTED]}" "$CYAN"
+    row "Bypass local:" "${DV[BYP_LOCAL]}" "$CYAN" "Bypass cap:" "${DV[BYP_CAP]}" "$CYAN" "Bypass pkts:" "${DV[BYP_PKTS]}" "$YELLOW"
+    row "Bypass closed:" "${DV[BYP_CLOSED]}" "$CYAN" "TCP reuse:" "${DV[FLOW_TCP_REUSE]}" "$CYAN" "Flow mem use:" "${DV[FLOW_MEM_USE]}" "$YELLOW"
+
+    section "APP-LAYER PROTOCOLS (flows detected)"
+    row "HTTP:" "${DV[A_HTTP]}" "$CYAN" "TLS:" "${DV[A_TLS]}" "$CYAN" "DNS/TCP:" "${DV[A_DNS_TCP]}" "$CYAN"
+    row "DNS/UDP:" "${DV[A_DNS_UDP]}" "$CYAN" "QUIC:" "${DV[A_QUIC]}" "$CYAN" "SSH:" "${DV[A_SSH]}" "$CYAN"
+    row "FTP:" "${DV[A_FTP]}" "$CYAN" "SMB:" "${DV[A_SMB]}" "$CYAN" "DHCP:" "${DV[A_DHCP]}" "$CYAN"
+    row "NTP:" "${DV[A_NTP]}" "$CYAN" "DCERPC/T:" "${DV[A_DCERPC_TCP]}" "$CYAN" "DCERPC/U:" "${DV[A_DCERPC_UDP]}" "$CYAN"
+
+    section "OTHER PROTOCOLS"
+    show_other_protos
+
+    section "DETECTION & INSPECTION"
+    row "Total alerts:" "${DV[ALERTS]}" "$RED${BOLD}" "Rules loaded:" "$rules_txt" "$YELLOW" "Suppressed:" "${DV[DETECT_SUPPR]}" "$CYAN"
+    row "Queue ovfl:" "${DV[DETECT_QUEUE]}" "$YELLOW" "Frag reasm:" "${DV[FRAG_REASM]}" "$CYAN" "Frag timeouts:" "${DV[FRAG_TIMEOUTS]}" "$YELLOW"
+    row "Frag packets:" "${DV[FRAG_FRAGS]}" "$CYAN" "Frag memcap:" "${DV[FRAG_MEMCAP]}" "$CYAN" "Frag max-hits:" "${DV[FRAG_MAXHITS]}" "$CYAN"
+    row "App errors:" "${DV[AL_ERR]}" "$YELLOW" "App gaps:" "${DV[AL_GAP]}" "$CYAN" "App failed:" "${DV[AL_FAILED]}" "$CYAN"
+    row "Bad checksums:" "${DV[TCP_BAD_CSUM]}" "$YELLOW" "Frag mem use:" "${DV[FRAG_MEM_USE]}" "$CYAN" "Inspect:" "$inspect" "$GREEN"
+
+    printf '\n'
+    show_alert_boxes
+
+    printf '\n'
+    show_eve_stats
+
+    show_health
+
+    printf '\n'
+    printf '%s\n' "${BLUE}${BOLD}${rule}${NC}"
+    printf '%s\n' "${WHITE}  Refresh every ${CYAN}${REFRESH_INTERVAL}s${NC} | ${WHITE}Stop: ${RED}q / Ctrl+C${NC} | ${WHITE}Log: ${CYAN}${FAST_LOG}${NC}"
+    printf '%s\n' "${DIM}  Suridash ${Suridash_Version} - read-only mode: nothing in the Suricata configuration is modified.${NC}"
+    printf '%s\n' "${BLUE}${BOLD}${rule}${NC}"
+}
+
+# ------------------------------------------------------------------------------
+# CYCLE: collect everything and build the next frame
+# ------------------------------------------------------------------------------
+set_frame() {
+    local t
+    FRAME="$1"
+    t="${FRAME//[^$'\n']/}"
+    FRAME_LINES=$(( ${#t} + 1 ))
+}
+
+collect_cycle() {
+    CYCLE=$(( CYCLE + 1 ))
+    get_now_ms
+
+    if [ "$SOCKET_STATUS" != "OK" ]; then
+        discover_socket && get_suricata_version
+    fi
+    if [ "$SOCKET_STATUS" = "OK" ]; then
+        JSON_DATA="$(sc_json dump-counters 2>/dev/null || true)"
+        get_now_ms
+        [ -n "$JSON_DATA" ] || SOCKET_STATUS="FAILED"
+    fi
+    if [ "$SOCKET_STATUS" != "OK" ]; then
+        update_term_width
+        set_frame "$(show_connection_error)"
+        return 1
+    fi
+
+    parse_counters "$JSON_DATA"
+    compute_effective
+    calculate_all_rates
+    update_term_width
+    compute_health
+
+    if [ "$(safe_int "${PKT_RATE%.*}")" -gt "$HIGH_LOAD_PPS" ]; then
+        LOAD_LABEL="HIGH LOAD"
+        ACTIVE_EVE_LINES="$EVE_SAMPLE_LINES_HIGH"
+    else
+        LOAD_LABEL="NORMAL"
+        ACTIVE_EVE_LINES="$EVE_SAMPLE_LINES"
+    fi
+
+    if [ "$FORCE_REFRESH" = "1" ] \
+       || [ $(( NOW_TS - LAST_EVE_TS )) -ge $(( EVE_REFRESH_EVERY * REFRESH_INTERVAL * 1000 )) ]; then
+        collect_eve_stats "$ACTIVE_EVE_LINES"
+        EVE_DISPLAY_SAMPLE="$ACTIVE_EVE_LINES"
+        collect_recent_alerts
+        LAST_EVE_TS="$NOW_TS"
+    fi
+    if [ "$FORCE_REFRESH" = "1" ] \
+       || [ $(( NOW_TS - LAST_SLOW_TS )) -ge $(( SLOW_REFRESH_EVERY * REFRESH_INTERVAL * 1000 )) ]; then
+        get_rules_loaded
+        [ "${UPTIME_C:-0}" -gt 0 ] || sync_uptime
+        LAST_SLOW_TS="$NOW_TS"
+    fi
+    FORCE_REFRESH=0
+    resolve_uptime
+    get_other_protos
+
+    set_frame "$(render_frame)"
+    return 0
+}
+
+# ------------------------------------------------------------------------------
+# INTERACTIVE DISPLAY
+# ------------------------------------------------------------------------------
+draw() {
+    local rows body maxoff status
+    rows="$(tput lines 2>/dev/null || echo 40)"
+    [[ "$rows" =~ ^[0-9]+$ ]] || rows=40
+    body=$(( rows - 1 )); [ "$body" -lt 5 ] && body=5
+    maxoff=$(( FRAME_LINES - body )); [ "$maxoff" -lt 0 ] && maxoff=0
+    [ "$OFFSET" -gt "$maxoff" ] && OFFSET="$maxoff"
+    [ "$OFFSET" -lt 0 ] && OFFSET=0
+
+    status=" q quit | p pause | r refresh | j/k PgUp/PgDn g/G scroll | lines $((OFFSET+1))-$(( OFFSET+body > FRAME_LINES ? FRAME_LINES : OFFSET+body ))/${FRAME_LINES}"
+    [ "$PAUSED" = "1" ] && status+=" | PAUSED"
+
+    printf '\033[H'
+    printf '%s\n' "$FRAME" | awk -v a=$((OFFSET+1)) -v b=$((OFFSET+body)) \
+        'NR >= a && NR <= b { printf "%s\033[K\n", $0 }'
+    printf '\033[J\033[%d;1H%s%s%s\033[K' "$rows" "$REV" "$status" "$NC"
+}
+
+# Wait up to REFRESH_INTERVAL for the next cycle while serving key presses.
+wait_for_input() {
+    local deadline remain t key rest rows body
+    get_now_ms
+    deadline=$(( NOW_TS + REFRESH_INTERVAL * 1000 ))
+    while true; do
+        get_now_ms
+        remain=$(( deadline - NOW_TS ))
+        if [ "$PAUSED" = "0" ] && [ "$remain" -le 0 ]; then return; fi
+        [ "$remain" -lt 50 ] && remain=200
+        if [ -t 0 ]; then
+            printf -v t '%d.%03d' $(( remain / 1000 )) $(( remain % 1000 ))
+            key=""
+            if read -rsn1 -t "$t" key; then
+                if [ "$key" = $'\e' ]; then
+                    read -rsn2 -t 0.02 rest || rest=""
+                    case "$rest" in
+                        "[A") key="k" ;;
+                        "[B") key="j" ;;
+                        "[5") key="PGUP" ;;
+                        "[6") key="PGDN" ;;
+                        "[H") key="g" ;;
+                        "[F") key="G" ;;
+                        *)    key="" ;;
+                    esac
+                fi
+                rows="$(tput lines 2>/dev/null || echo 40)"; body=$(( rows - 2 ))
+                case "$key" in
+                    q|Q) exit 0 ;;
+                    p|P) if [ "$PAUSED" = "1" ]; then PAUSED=0; return; else PAUSED=1; draw; fi ;;
+                    r|R) FORCE_REFRESH=1; PAUSED=0; return ;;
+                    j)   OFFSET=$(( OFFSET + 1 )); draw ;;
+                    k)   OFFSET=$(( OFFSET - 1 )); draw ;;
+                    PGDN|" ") OFFSET=$(( OFFSET + body )); draw ;;
+                    PGUP|b)   OFFSET=$(( OFFSET - body )); draw ;;
+                    g)   OFFSET=0; draw ;;
+                    G)   OFFSET=999999; draw ;;
+                esac
+            fi
+        else
+            sleep "$(( remain / 1000 + 1 ))"
+            [ "$PAUSED" = "1" ] || return
+        fi
+    done
+}
+
+# ------------------------------------------------------------------------------
+# STARTUP
+# ------------------------------------------------------------------------------
+discover_socket
+[ "$SOCKET_STATUS" = "OK" ] && get_suricata_version
+get_now_ms
+update_term_width
+
+# ---- diagnostic modes ----------------------------------------------------------
+if [ "$DEBUG_COUNTERS" = "1" ] || [ "$CHECK_MODE" = "1" ]; then
+    if [ "$SOCKET_STATUS" != "OK" ]; then
+        show_connection_error
+        exit 1
+    fi
+    JSON_DATA="$(sc_json dump-counters 2>/dev/null || true)"
+    if [ -z "$JSON_DATA" ]; then
+        printf '%s\n' "${RED}[-] dump-counters returned nothing.${NC}"
+        exit 1
+    fi
+    if [ "$DEBUG_COUNTERS" = "1" ]; then
+        dump_keys "$JSON_DATA"
+    else
+        parse_counters "$JSON_DATA"
+        check_report
+    fi
+    exit 0
+fi
+
+# ---- single frame ---------------------------------------------------------------
+[ -t 1 ] || ONCE=1
+if [ "$ONCE" = "1" ]; then
+    collect_cycle
+    if [ "$SOCKET_STATUS" = "OK" ]; then
+        sleep 2                # second sample gives the rates a baseline
+        collect_cycle
+    fi
+    printf '%s\n' "$FRAME"
+    exit 0
+fi
+
+# ---- interactive ---------------------------------------------------------------
+INTERACTIVE=1
+STTY_SAVE="$(stty -g 2>/dev/null || true)"
+printf '\033[?1049h\033[?7l\033[?25l\033[2J'
+
+while true; do
+    collect_cycle
+    draw
+    wait_for_input
+done
