@@ -1,9 +1,9 @@
 # sl0ppy-SuriDash
-Sl0ppy-SuriDash is a bash based dashboard for suricata in IDS Mode
+Sl0ppy-SuriDash is a bash based dashboard for suricata in IDS or IPS Mode
 
 # sl0ppy-SuriDash Pre Requirements
 * One must install suricata, jq.  
-* Config suricata as IDS
+* Config suricata as IDS Preferable, or of only logging still can use the dashboard.
 * This tool does not automate that...!!! (maybe later supported)
 * Make sure to configure suricata as IDS, with working socket, Then run the Dashboard
 
