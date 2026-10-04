@@ -114,7 +114,7 @@ sudo ./sl0ppy-SuriDash
 
 
 
-# IDS vs IPS note: the dashboard is read-only and works with either mode. You're currently in IDS mode (monitor + alert). Only switch to IPS (NFQUEUE inline blocking) if you actually want Suricata to drop packets — that requires routing traffic through NFQUEUE rules and is a bigger change:
+* IDS vs IPS note: the dashboard is read-only and works with either mode. You're currently in IDS mode (monitor + alert). Only switch to IPS (NFQUEUE inline blocking) if you actually want Suricata to drop packets that requires routing traffic through NFQUEUE rules and is a bigger change:
 
 
 
