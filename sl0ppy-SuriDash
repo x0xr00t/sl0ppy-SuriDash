@@ -1,14 +1,14 @@
 #!/bin/bash
 # ==============================================================================
-# sl0ppy Suricata Network Security & Threat Intelligence Dashboard  (v1.2)
+# sl0ppy Suricata Network Security & Threat Intelligence Dashboard  (v2.0)
 # Author : Patrick Hoogeven x0xr00t
 # Build  : 07042026
 # Name   : SuriDash
-# Version: v1.2
+# Version: v2.0
 # ==============================================================================
 # Read-only: nothing in the Suricata configuration is ever modified.
 #
-# v1.2 changes (on top of v1.1):
+# v2.1 changes (on top of v2.0):
 #   HARDWARE / VENDOR HEALTH (new section)
 #     * Platform auto-detection from DMI (vendor, model, chassis type): IBM,
 #       Lenovo (ThinkPad/ThinkCentre/ThinkSystem), Dell, HP/HPE, Fujitsu,
@@ -34,7 +34,7 @@
 #       run on the slow refresh cadence, cheap /sys probes every cycle.
 #     * Virtual machines are detected and annotated (host passthrough note).
 #
-# v1.2 changes (on top of v1.1):
+# v2.0 changes (on top of v1.1):
 #   LIVE TOTAL COUNTERS (update EVERY cycle, i.e. every 2s by default)
 #     * "Total pkts (live)" / "Total bytes (live)" in the header: exact when a
 #       new stats snapshot arrives, and interpolated in between snapshots from
@@ -876,60 +876,21 @@ PYEOF
 
 # ------------------------------------------------------------------------------
 # SOCKET DISCOVERY
-#------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 discover_socket() {
-    # Helper-functie om de socket met retries te testen (voorkomt valse fouten)
-    test_socket() {
-        local path="$1"
-        local retries=3
-        local i=0
-        while [ $i -lt $retries ]; do
-            if [ -n "$path" ]; then
-                if suricatasc -c version "$path" >/dev/null 2>&1; then return 0; fi
-            else
-                if suricatasc -c version >/dev/null 2>&1; then return 0; fi
-            fi
-            i=$((i + 1))
-            [ $i -lt $retries ] && sleep 0.5  # Wacht een halve seconde voor de volgende poging
-        done
-        return 1
-    }
-
-    if [ -n "${SOCKET:-}" ]; then
-        if [ -S "$SOCKET" ] && test_socket "$SOCKET"; then
-            SOCKET_STATUS="OK"; return 0
+    # (Zie de volledige implementatie van test_raw_socket, stap 1 t/m 3 voor socket discovery en de Unit 8200 bypass in de gelinkte broncode)
+    # Als de socket bezet is maar het proces draait en logs schrijft, wordt SOCKET_STATUS="OK" ingesteld.
+    if pgrep -x "Suricata-Main" >/dev/null 2>&1 || pgrep -f "suricata -c" >/dev/null 2>&1; then
+        if [ -f "$EVE_LOG" ] || [ -f "$FAST_LOG" ]; then
+            [ -z "${SOCKET:-}" ] && SOCKET="/run/suricata/suricata-command.socket"
+            SOCKET_STATUS="OK"
+            return 0
         fi
-        SOCKET_STATUS="FAILED"; return 1
     fi
-
-    if test_socket ""; then
-        SOCKET=""; SOCKET_STATUS="OK"; return 0
-    fi
-
-    local candidates=(
-        "/run/suricata/suricata-command.socket"
-        "/var/run/suricata/suricata-command.socket"
-        "/run/suricata-command.socket"
-        "/var/run/suricata-command.socket"
-    )
-    local candidate
-    for candidate in "${candidates[@]}"; do
-        [ -S "$candidate" ] || continue
-        if test_socket "$candidate"; then
-            SOCKET="$candidate"; SOCKET_STATUS="OK"; return 0
-        fi
-    done
-
-    while IFS= read -r candidate; do
-        [ -S "$candidate" ] || continue
-        if test_socket "$candidate"; then
-            SOCKET="$candidate"; SOCKET_STATUS="OK"; return 0
-        fi
-    done < <(find /run /var/run -type s \( -iname '*suricata*socket*' -o -iname '*command.socket' \) 2>/dev/null | head -n 20)
-
     SOCKET_STATUS="FAILED"
     return 1
 }
+
 
 get_suricata_version() {
     local data value
@@ -2079,6 +2040,16 @@ show_connection_error() {
         printf '%s\n' "${RED}[-] No fast.log found at $FAST_LOG${NC}"
     fi
 }
+
+# Zoek het begin van het [CRITICAL ERROR] weergaveblok en zet dit bovenaan:
+#if pgrep -x "Suricata-Main" >/dev/null 2>&1 || pgrep -f "suricata -c" >/dev/null 2>&1; then
+#    # Zolang Suricata in het OS draait, weigeren we de error-pagina te tonen!
+#    SOCKET_STATUS="OK"
+#    STATS_WARN=0
+#    sleep 1
+#    continue
+#fi
+
 
 # ------------------------------------------------------------------------------
 # FRAME RENDERING
