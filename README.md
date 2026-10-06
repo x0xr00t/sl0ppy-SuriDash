@@ -1,10 +1,12 @@
 # sl0ppy-SuriDash
 Sl0ppy-SuriDash is a bash based dashboard for suricata in IDS or IPS Mode
 
+# change log 
+* added support for docker 
+
 # sl0ppy-SuriDash Pre Requirements
 * One must install suricata, jq.  
-* Config suricata as IDS Preferable, or of only logging still can use the dashboard.
-* This tool does not automate that...!!! (maybe later supported)
+* Config suricata as IDS Preferable, or IPS both work for the dashboard.
 * Make sure to configure suricata as IDS|IPS, with working socket, Then run the Dashboard
 
 # Requirements 
@@ -123,6 +125,15 @@ sudo ./sl0ppy-SuriDash
 ```
 sudo iptables -I INPUT -p tcp -j NFQUEUE --queue-num 0
 sudo iptables -I OUTPUT -p tcp -j NFQUEUE --queue-num 0
+```
+
+# Docker Install
+```
+# put suridash.sh, Dockerfile, entrypoint.sh, suricata.yaml and ./rules in one dir
+docker compose build
+docker compose up -d suricata          # start the sensor
+docker compose run --rm suridash       # attach the live dashboard
+docker compose run --rm suridash --check   # verify counter mapping
 ```
 
 
