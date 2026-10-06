@@ -876,16 +876,33 @@ PYEOF
 
 # ------------------------------------------------------------------------------
 # SOCKET DISCOVERY
-# ------------------------------------------------------------------------------
+#------------------------------------------------------------------------------
 discover_socket() {
+    # Helper-functie om de socket met retries te testen (voorkomt valse fouten)
+    test_socket() {
+        local path="$1"
+        local retries=3
+        local i=0
+        while [ $i -lt $retries ]; do
+            if [ -n "$path" ]; then
+                if suricatasc -c version "$path" >/dev/null 2>&1; then return 0; fi
+            else
+                if suricatasc -c version >/dev/null 2>&1; then return 0; fi
+            fi
+            i=$((i + 1))
+            [ $i -lt $retries ] && sleep 0.5  # Wacht een halve seconde voor de volgende poging
+        done
+        return 1
+    }
+
     if [ -n "${SOCKET:-}" ]; then
-        if [ -S "$SOCKET" ] && suricatasc -c version "$SOCKET" >/dev/null 2>&1; then
+        if [ -S "$SOCKET" ] && test_socket "$SOCKET"; then
             SOCKET_STATUS="OK"; return 0
         fi
         SOCKET_STATUS="FAILED"; return 1
     fi
 
-    if suricatasc -c version >/dev/null 2>&1; then
+    if test_socket ""; then
         SOCKET=""; SOCKET_STATUS="OK"; return 0
     fi
 
@@ -898,14 +915,14 @@ discover_socket() {
     local candidate
     for candidate in "${candidates[@]}"; do
         [ -S "$candidate" ] || continue
-        if suricatasc -c version "$candidate" >/dev/null 2>&1; then
+        if test_socket "$candidate"; then
             SOCKET="$candidate"; SOCKET_STATUS="OK"; return 0
         fi
     done
 
     while IFS= read -r candidate; do
         [ -S "$candidate" ] || continue
-        if suricatasc -c version "$candidate" >/dev/null 2>&1; then
+        if test_socket "$candidate"; then
             SOCKET="$candidate"; SOCKET_STATUS="OK"; return 0
         fi
     done < <(find /run /var/run -type s \( -iname '*suricata*socket*' -o -iname '*command.socket' \) 2>/dev/null | head -n 20)
