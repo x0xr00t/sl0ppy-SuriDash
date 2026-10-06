@@ -1,14 +1,14 @@
 #!/bin/bash
 # ==============================================================================
-# sl0ppy Suricata Network Security & Threat Intelligence Dashboard  (v2.0)
+# sl0ppy Suricata Network Security & Threat Intelligence Dashboard  (v1.2)
 # Author : Patrick Hoogeven x0xr00t
 # Build  : 07042026
 # Name   : SuriDash
-# Version: v2.0
+# Version: v1.2
 # ==============================================================================
 # Read-only: nothing in the Suricata configuration is ever modified.
 #
-# v2.1 changes (on top of v2.0):
+# v1.2 changes (on top of v1.1):
 #   HARDWARE / VENDOR HEALTH (new section)
 #     * Platform auto-detection from DMI (vendor, model, chassis type): IBM,
 #       Lenovo (ThinkPad/ThinkCentre/ThinkSystem), Dell, HP/HPE, Fujitsu,
@@ -34,7 +34,7 @@
 #       run on the slow refresh cadence, cheap /sys probes every cycle.
 #     * Virtual machines are detected and annotated (host passthrough note).
 #
-# v2.0 changes (on top of v1.1):
+# v1.2 changes (on top of v1.1):
 #   LIVE TOTAL COUNTERS (update EVERY cycle, i.e. every 2s by default)
 #     * "Total pkts (live)" / "Total bytes (live)" in the header: exact when a
 #       new stats snapshot arrives, and interpolated in between snapshots from
@@ -80,7 +80,7 @@ fi
 if [ -n "${LC_ALL:-}" ]; then export LANG="$LC_ALL"; unset LC_ALL; fi
 export LC_NUMERIC=C
 
-Suridash_Version="v2.1"
+Suridash_Version="v1.2"
 
 # ------------------------------------------------------------------------------
 # COLORS & STYLING (real escape characters: safe for printf '%s')
