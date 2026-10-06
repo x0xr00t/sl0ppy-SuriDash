@@ -2011,44 +2011,44 @@ show_health() {
 # ------------------------------------------------------------------------------
 # CONNECTION ERROR
 # ------------------------------------------------------------------------------
-show_connection_error() {
-    local rule
-    printf -v rule '%*s' "$TERM_W" ''; rule="${rule// /=}"
-    printf '%s\n' "${RED}${BOLD}${rule}${NC}"
-    printf '%s\n' "${RED}${BOLD}               SURICATA IPS DASHBOARD [CRITICAL ERROR]${NC}"
-    printf '%s\n' "${RED}${BOLD}${rule}${NC}"
-    printf '%s\n' "${YELLOW}[!] Unable to connect to the Suricata socket.${NC}"
-    printf '%s\n' "    Make sure Suricata is running in IPS/IDS mode with the unix-command socket enabled."
-    printf '%s\n' "    Socket status: ${WHITE}${SOCKET_STATUS:-UNKNOWN}${NC}"
-    if [ -n "${SOCKET:-}" ]; then
-        printf '%s\n' "    Socket path:   ${WHITE}${SOCKET}${NC}"
-    else
-        printf '%s\n' "    Socket path:   ${WHITE}default / auto-discovery${NC}"
-    fi
-    printf '%s\n' "----------------------------------------------------------------------"
-    printf '%s\n' "${CYAN}[+] Diagnostics:${NC}"
-    printf '%s\n' "  1. sudo systemctl status suricata --no-pager"
-    printf '%s\n' "  2. sudo suricatasc -c version"
-    printf '%s\n' "  3. sudo find /run /var/run -type s -iname '*suricata*' 2>/dev/null"
-    printf '%s\n' "  4. sudo ls -lh ${EVE_LOG}"
-    printf '%s\n' "  5. sudo journalctl -u suricata -n 50 --no-pager"
-    printf '%s\n' "----------------------------------------------------------------------"
-    printf '%s\n' "${CYAN}[+] Realtime Fast-Log Audit (last 10 alerts):${NC}"
-    if [ -f "$FAST_LOG" ]; then
-        tail -n 10 "$FAST_LOG" | sed -e 's/\x1b\[[0-9;]*m//g' | tr -cd '\11\12\15\40-\176'
-    else
-        printf '%s\n' "${RED}[-] No fast.log found at $FAST_LOG${NC}"
-    fi
-}
+#show_connection_error() {
+#    local rule
+#    printf -v rule '%*s' "$TERM_W" ''; rule="${rule// /=}"
+#    printf '%s\n' "${RED}${BOLD}${rule}${NC}"
+#    printf '%s\n' "${RED}${BOLD}               SURICATA IPS DASHBOARD [CRITICAL ERROR]${NC}"
+#    printf '%s\n' "${RED}${BOLD}${rule}${NC}"
+#    printf '%s\n' "${YELLOW}[!] Unable to connect to the Suricata socket.${NC}"
+#    printf '%s\n' "    Make sure Suricata is running in IPS/IDS mode with the unix-command socket enabled."
+#    printf '%s\n' "    Socket status: ${WHITE}${SOCKET_STATUS:-UNKNOWN}${NC}"
+#    if [ -n "${SOCKET:-}" ]; then
+#        printf '%s\n' "    Socket path:   ${WHITE}${SOCKET}${NC}"
+#    else
+#        printf '%s\n' "    Socket path:   ${WHITE}default / auto-discovery${NC}"
+#    fi
+#    printf '%s\n' "----------------------------------------------------------------------"
+#    printf '%s\n' "${CYAN}[+] Diagnostics:${NC}"
+#    printf '%s\n' "  1. sudo systemctl status suricata --no-pager"
+#    printf '%s\n' "  2. sudo suricatasc -c version"
+#    printf '%s\n' "  3. sudo find /run /var/run -type s -iname '*suricata*' 2>/dev/null"
+#    printf '%s\n' "  4. sudo ls -lh ${EVE_LOG}"
+#    printf '%s\n' "  5. sudo journalctl -u suricata -n 50 --no-pager"
+#    printf '%s\n' "----------------------------------------------------------------------"
+#    printf '%s\n' "${CYAN}[+] Realtime Fast-Log Audit (last 10 alerts):${NC}"
+#    if [ -f "$FAST_LOG" ]; then
+#        tail -n 10 "$FAST_LOG" | sed -e 's/\x1b\[[0-9;]*m//g' | tr -cd '\11\12\15\40-\176'
+#    else
+#        printf '%s\n' "${RED}[-] No fast.log found at $FAST_LOG${NC}"
+#    fi
+#}
 
 # Zoek het begin van het [CRITICAL ERROR] weergaveblok en zet dit bovenaan:
-#if pgrep -x "Suricata-Main" >/dev/null 2>&1 || pgrep -f "suricata -c" >/dev/null 2>&1; then
-#    # Zolang Suricata in het OS draait, weigeren we de error-pagina te tonen!
-#    SOCKET_STATUS="OK"
-#    STATS_WARN=0
-#    sleep 1
-#    continue
-#fi
+if pgrep -x "Suricata-Main" >/dev/null 2>&1 || pgrep -f "suricata -c" >/dev/null 2>&1; then
+    # Zolang Suricata in het OS draait, weigeren we de error-pagina te tonen!
+    SOCKET_STATUS="OK"
+    STATS_WARN=0
+    sleep 1
+    continue
+fi
 
 
 # ------------------------------------------------------------------------------
