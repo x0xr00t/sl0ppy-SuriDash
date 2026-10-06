@@ -6,6 +6,10 @@ Sl0ppy-SuriDash is a bash based dashboard for suricata in IDS or IPS Mode
 * Added wider vendor health support (ibm, lenovo, dell, hp and more.)
 * optimized counters and other bits check the header for all info. 
 
+# IMPORTANT NOTICE DOCKER
+* If u want to use this with the new source ( best to check if dockerfile, docker-compose.yml & needs to be checked if not needs to be rebuild before deployment )
+* will check this tonight and fix it if needed 
+
 # sl0ppy-SuriDash Pre Requirements
 * One must install suricata, jq.  
 * Config suricata as IDS Preferable, or IPS both work for the dashboard.
