@@ -1,0 +1,79 @@
+# SuriDash stack: Suricata sensor + SuriDash TUI
+#
+# Build & start the sensor:
+#   docker compose build
+#   docker compose up -d suricata
+#
+# Attach the interactive dashboard:
+#   docker compose run --rm suridash
+#
+# One-shot frame / counter check:
+#   docker compose run --rm suridash --once
+#   docker compose run --rm suridash --check
+
+services:
+
+  # ---------------------------------------------------------------- Suricata
+  # Runs the IDS/IPS engine. Needs AF_PACKET access to the host NICs, so it
+  # uses host networking + NET_ADMIN + CAP_SYS_RESOURCE (bigger capture rings).
+  suricata:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: suridash:latest
+    container_name: suricata
+    init: true
+    network_mode: host          # sniff host interfaces directly
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_RESOURCE
+    restart: unless-stopped
+    environment:
+      # Comma-separated list of interfaces to sniff; empty = single IFACE below
+      SURICATA_IFACE: "eth0"
+      SURICATA_HOMENET: "[192.168.0.0/16,10.0.0.0/8,172.16.0.0/12]"
+      # Rules provider: local rules dir mounted below, or OITC/ET providers
+      SURICATA_RULES_PATH: "/var/lib/suricata/rules"
+    volumes:
+      - suricata-log:/var/log/suricata      # fast.log / eve.json
+      - suricata-run:/run/suricata          # command socket (shared with dash)
+      - ./suricata.yaml:/etc/suricata/suricata.yaml:ro
+      - ./rules:/var/lib/suricata/rules:ro  # your rule files
+    command: ["suricata", "-D", "--unix-socket=/run/suricata/suricata-command.socket", "-c", "/etc/suricata/suricata.yaml", "-i", "${SURICATA_IFACE:-eth0}"]
+
+  # ---------------------------------------------------------------- SuriDash
+  # The dashboard. It is a fullscreen TUI, so it is not a daemon: run it with
+  # `docker compose run --rm suridash` and you get the live dashboard in your
+  # terminal. It reads the socket + logs shared from the suricata container.
+  suridash:
+    image: suridash:latest
+    container_name: suridash
+    depends_on:
+      - suricata
+    network_mode: service:suricata   # reuse host net ns so /proc/net/dev rates work
+    pid: service:suricata            # see the sensor's proc view (uptime fallback)
+    cap_add:
+      - NET_RAW
+    stdin_open: true
+    tty: true                         # needed for the interactive UI
+    environment:
+      SURICATA_SOCKET: /run/suricata/suricata-command.socket
+      FAST_LOG: /var/log/suricata/fast.log
+      EVE_LOG: /var/log/suricata/eve.json
+      REFRESH_INTERVAL: "2"
+      # Restrict the NIC rate fallback to the sniffing interfaces:
+      NIC_IFACES: "eth0"
+      # FP labelling
+      FP_LABEL: "unit8200"
+      FP_REGEX: "unit8200"
+      FP_HIDE: "0"
+      HEALTH_HOLD_S: "30"
+    volumes:
+      - suricata-log:/var/log/suricata:ro
+      - suricata-run:/run/suricata:ro
+    entrypoint: ["/opt/suridash/suridash.sh"]
+
+volumes:
+  suricata-log:
+  suricata-run:
