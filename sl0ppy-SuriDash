@@ -1,70 +1,77 @@
 #!/bin/bash
 # ==============================================================================
-# sl0ppy Suricata Network Security & Threat Intelligence Dashboard  (v1.2)
+# sl0ppy Suricata Network Security & Threat Intelligence Dashboard  (v1.3)
 # Author : Patrick Hoogeven x0xr00t
-# Build  : 07042026
+# Build  : 07102026
 # Name   : SuriDash
-# Version: v1.2
+# Version: v1.3
 # ==============================================================================
 # Read-only: nothing in the Suricata configuration is ever modified.
 #
-# v1.2 changes (on top of v1.1):
-#   HARDWARE / VENDOR HEALTH (new section)
-#     * Platform auto-detection from DMI (vendor, model, chassis type): IBM,
-#       Lenovo (ThinkPad/ThinkCentre/ThinkSystem), Dell, HP/HPE, Fujitsu,
-#       Supermicro, Huawei, ASUS, Acer, MSI, Gigabyte, Apple, Oracle/Sun,
-#       Toshiba, Samsung, and virtual platforms (QEMU/KVM, VMware, Hyper-V,
-#       Xen, VirtualBox).
-#     * Vendor toolchain probing (a tool is only used when installed):
-#       iprconfig (IBM ServeRAID/ipr), thinkpad-acpi + storcli/OneCLI
-#       (Lenovo), hpasmcli/ssacli/hpssacli (HPE), omreport/racadm (Dell),
-#       storcli/MegaCli/arcconf (LSI/Broadcom - used by Lenovo, IBM, Dell,
-#       Supermicro, Fujitsu OEM controllers), lm-sensors, smartmontools,
-#       edac, ipmitool as the generic layer for every vendor.
-#     * CPU temperature chain: kernel thermal_zone -> lm-sensors ->
-#       ThinkPad ACPI (/proc/acpi/ibm) -> IPMI SDR (the most authoritative
-#       source for the platform wins); fan RPM through the same chain.
-#     * Battery status / charge / wear % (Lenovo ThinkPad, all laptops via
-#       /sys/class/power_supply), CPU frequency + thermal cap detection.
-#     * SMART health scan of every sd*/nvme* disk (-n standby: sleeping
-#       disks are never spun up), RAID controller status, EDAC memory
-#       CE/UE error counts, IPMI SEL tail, hardware health score with
-#       HW_TEMP_WARN / HW_TEMP_CRIT thresholds.
-#     * SMART_ENABLED / IPMI_ENABLED switches; deep probes (SMART/RAID/SEL)
-#       run on the slow refresh cadence, cheap /sys probes every cycle.
-#     * Virtual machines are detected and annotated (host passthrough note).
+# v1.3 changes (on top of v1.2):
+#   COUNTER CONTINUITY ENGINE (new)
+#     * Switching between the Suricata socket and the NIC counters (in either
+#       direction) can NEVER make the counters jump backwards, spike, or lose
+#       the traffic that was counted in the other mode. Everything the
+#       dashboard counted while running on NIC / estimator data is carried
+#       over ("cached") and merged back into the socket stats the moment the
+#       socket delivers a fresh snapshot again - the totals keep counting as
+#       if nothing happened.
+#     * Monotonic totals: "Total pkts (live)" / "Total bytes (live)" never
+#       decrease. On every fresh socket snapshot the engine takes
+#       max(socket value, cached live value) as the new anchor, so the NIC
+#       traffic seen during a busy socket window is never lost when the
+#       socket comes back (Suricata may have missed packets while busy - the
+#       cached NIC numbers are the more complete truth and they are kept).
+#     * Suricata restart / counter reset handling: when a lifetime counter
+#       (packets, bytes, flows, alerts, drops, ARP) restarts from 0, the
+#       previously observed lifetime is added as an offset, so adjusted
+#       lifetime totals keep counting across Suricata restarts. The raw
+#       Suricata value is still shown per counter; the rate/live-total engine
+#       uses the adjusted monotonic value. No fake "counter reset" rate
+#       spikes any more either.
+#     * NIC BUSY HANDLING (unit8200 workaround/bypass):
+#         - If /proc/net/dev is unreadable, or the NIC counters freeze while
+#           the socket is also busy, the dashboard switches to the
+#           estimator mode (labelled "unit8200 est" by default, override
+#           with EST_LABEL). Rates are held and decayed smoothly, and the
+#           live totals are extrapolated at the decayed rate so the numbers
+#           keep moving naturally instead of freezing.
+#         - Estimator mode is left automatically as soon as either the
+#           socket answers again or the NIC counters start moving again.
+#     * Rate continuity across every mode switch: socket rates are always
+#       computed over the REAL elapsed time between usable data points
+#       (snapshot -> snapshot, NIC -> socket, estimator -> socket), so the
+#       first socket snapshot after a busy/est window is the AVERAGE over the
+#       whole window: no spikes, no freeze, no visual glitch.
+#     * One decay engine for all held rates (pps, Mbit/s, drops/s, alerts/s,
+#       flows/s, ARP pps) that runs in every non-fresh mode so displayed
+#       values LOWER smoothly when traffic lowers, in any mode.
+#     * Health section shows the current data mode (socket / nic / est),
+#       the number of mode switches and the carried-over cache.
+#     * New env: NIC_STALE_S (6) - seconds without NIC counter movement
+#                (while traffic is expected) before estimator mode.
+#                EST_LABEL ("unit8200") - label for the estimator mode.
 #
-# v1.2 changes (on top of v1.1):
-#   LIVE TOTAL COUNTERS (update EVERY cycle, i.e. every 2s by default)
-#     * "Total pkts (live)" / "Total bytes (live)" in the header: exact when a
-#       new stats snapshot arrives, and interpolated in between snapshots from
-#       the live NIC counters (/proc/net/dev) anchored at the last snapshot.
-#       They move EVERY refresh even if Suricata only dumps stats every 8s+.
-#     * Per-cycle live delta ("+N since last refresh") shown next to them.
-#   PER-COUNTER DELTAS ("+N" since the last stats tick) in EVERY section:
-#     * decoder (pkts, ipv4/ipv6, tcp/udp/icmp, ARP), flow, TCP, IPS, bypass,
-#       app-layer, defrag and detection counters all show what they gained at
-#       the last snapshot, so you can see each counter actually working.
-#   DECAY WHEN TRAFFIC LOWERS
-#     * pps / Mbit/s / drops/s / alerts/s / flows/s / ARP pps no longer freeze
-#       at a stale value until the next snapshot: once the socket snapshot
-#       data goes stale the held rates decay x0.75 per cycle, so the numbers
-#       (and only the numbers - the bars are untouched) fall smoothly when
-#       traffic lowers, and rise instantly on the next live sample.
-#   ARP FULLY WORKING
-#     * decoder.arp now resolves on every build (extra alternatives added:
-#       decoder.arp | decoder.arp_pkts | decoder.ethernet.arp), gets a live
-#       per-tick delta "+N", and its own decaying "ARP rate" in the header.
-#   BARS: make_graph / peak_roll / BLOCK40 logic is IDENTICAL to v1.1 - the
-#     auto-scaling bars behave exactly as before.
-#
-# v1.1 (unchanged) highlights:
-#   * counter map audited against the Suricata 7/8 stats tree, wildcard paths,
-#     object-sum lookups, "n/a" for keys your build does not expose.
-#   * socket rates computed over the real time between stats snapshots, NIC
-#     fallback between ticks, %.0f awk output (mawk-safe).
-#   * health penalties from per-cycle deltas held for HEALTH_HOLD_S seconds.
-#   * flicker-free redraw, scrolling, pause, --once, --check, --debug-counters.
+# v1.2 changes (kept):
+#   * Every suricatasc call wrapped in `timeout`; BUSY socket state with
+#     frozen snapshot, NIC fallback, periodic re-probe (SOCKET_RETRY_S),
+#     automatic recovery, real socket discovery, baseline guard.
+#   * Virtual machines detected and annotated; SMART/RAID/SEL deep probes on
+#     the slow cadence; cheap /sys probes every cycle.
+# v1.1 changes (kept):
+#   * Hardware / vendor health section (IBM, Lenovo, Dell, HP/HPE, Fujitsu,
+#     Supermicro, Huawei, ASUS, Acer, MSI, Gigabyte, Apple, Oracle/Sun,
+#     Toshiba, Samsung + virtual platforms), CPU temp chain
+#     (thermal_zone -> lm-sensors -> ThinkPad ACPI -> IPMI SDR), battery,
+#     CPU freq/throttle, SMART (-n standby), RAID toolchains, EDAC, IPMI SEL.
+#   * Live totals interpolated from /proc/net/dev between stats ticks,
+#     per-counter "+N" deltas in every section, rate decay, ARP rate.
+# v1.1 highlights (kept):
+#   * counter map audited against the Suricata 7/8 stats tree, wildcard
+#     paths, object-sum lookups, "n/a" for keys your build does not expose.
+#   * health penalties held HEALTH_HOLD_S, flicker-free redraw, scrolling,
+#     pause, --once, --check, --debug-counters, --debug-parse.
 #
 # Usage:  sudo ./suridash.sh [-i SECONDS] [--once] [--check] [--debug-counters]
 #         sudo ./suridash.sh --help
@@ -80,7 +87,7 @@ fi
 if [ -n "${LC_ALL:-}" ]; then export LANG="$LC_ALL"; unset LC_ALL; fi
 export LC_NUMERIC=C
 
-Suridash_Version="v1.2"
+Suridash_Version="v1.3"
 
 # ------------------------------------------------------------------------------
 # COLORS & STYLING (real escape characters: safe for printf '%s')
@@ -116,6 +123,15 @@ HEALTH_HOLD_S="${HEALTH_HOLD_S:-30}"
 NIC_IFACES="${NIC_IFACES:-}"
 SURICATA_YAML="${SURICATA_YAML:-/etc/suricata/suricata.yaml}"
 
+# ---- socket busy handling -----------------------------------------------------
+SOCKET_TIMEOUT="${SOCKET_TIMEOUT:-4}"            # s: max wait for a normal socket call
+SOCKET_BUSY_TIMEOUT="${SOCKET_BUSY_TIMEOUT:-2}"  # s: max wait for a probe while BUSY
+SOCKET_RETRY_S="${SOCKET_RETRY_S:-4}"            # s: pause between probes while BUSY
+
+# ---- continuity / estimator ---------------------------------------------------
+NIC_STALE_S="${NIC_STALE_S:-6}"                  # s: NIC frozen this long -> estimator
+EST_LABEL="${EST_LABEL:-unit8200}"               # label of the NIC-busy estimator mode
+
 # ---- hardware / vendor health ------------------------------------------------
 HW_TEMP_WARN="${HW_TEMP_WARN:-70}"     # CPU temp warn threshold (C)
 HW_TEMP_CRIT="${HW_TEMP_CRIT:-85}"     # CPU temp critical threshold (C)
@@ -124,7 +140,8 @@ IPMI_ENABLED="${IPMI_ENABLED:-1}"      # 0 disables ipmitool probes (slow BMCs)
 
 RATE_DECAY="0.75"     # per-cycle multiplier for stale held rates (bars untouched)
 
-SOCKET="${SURICATA_SOCKET:-}"
+SOCKET_USER="${SURICATA_SOCKET:-}"
+SOCKET="$SOCKET_USER"
 DEBUG_COUNTERS="${DEBUG_COUNTERS:-0}"
 DEBUG_RATES="${DEBUG_RATES:-0}"
 DEBUG_PARSE="${DEBUG_PARSE:-0}"
@@ -150,11 +167,18 @@ Usage: sudo $0 [options]
 Keys:  q quit | p pause | r refresh | j/k or arrows scroll | PgUp/PgDn,
        space/b page | g top | G bottom
 
+Continuity: switching between the Suricata socket, the NIC counters and the
+${EST_LABEL} estimator never resets or spikes the counters. Traffic counted in
+one mode is cached and merged back into the socket stats when the socket
+answers again - the totals keep counting. Live totals are monotonic and
+carry across Suricata restarts.
+
 Environment: REFRESH_INTERVAL FAST_LOG EVE_LOG SURICATA_SOCKET NIC_IFACES
   EVE_SAMPLE_LINES EVE_SAMPLE_LINES_HIGH HIGH_LOAD_PPS EVE_REFRESH_EVERY
   SLOW_REFRESH_EVERY ALERT_SCAN_LINES ALERT_MAX_SCAN ALERT_BOX_LINES
   FP_LABEL FP_REGEX FP_HIDE HEALTH_HOLD_S RATE_DECAY DEBUG_RATES
   HW_TEMP_WARN HW_TEMP_CRIT SMART_ENABLED IPMI_ENABLED
+  SOCKET_TIMEOUT SOCKET_BUSY_TIMEOUT SOCKET_RETRY_S NIC_STALE_S EST_LABEL
 EOF
 }
 
@@ -183,7 +207,8 @@ fi
 
 for _v in EVE_SAMPLE_LINES EVE_SAMPLE_LINES_HIGH HIGH_LOAD_PPS EVE_REFRESH_EVERY \
           SLOW_REFRESH_EVERY ALERT_SCAN_LINES ALERT_MAX_SCAN ALERT_BOX_LINES \
-          REFRESH_INTERVAL HEALTH_HOLD_S HW_TEMP_WARN HW_TEMP_CRIT; do
+          REFRESH_INTERVAL HEALTH_HOLD_S HW_TEMP_WARN HW_TEMP_CRIT \
+          SOCKET_TIMEOUT SOCKET_BUSY_TIMEOUT SOCKET_RETRY_S NIC_STALE_S; do
     if ! [[ "${!_v}" =~ ^[1-9][0-9]*$ ]]; then
         printf '%s\n' "${RED}[-] ${_v} must be a positive integer (got: '${!_v}').${NC}"
         exit 1
@@ -198,7 +223,7 @@ awk -v x="$RATE_DECAY" 'BEGIN { if (x <= 0 || x >= 1) exit 1 }' || RATE_DECAY="0
 # DEPENDENCY CHECK
 # ------------------------------------------------------------------------------
 MISSING=()
-for cmd in jq suricatasc awk sed tail tput date stat sort grep find; do
+for cmd in jq suricatasc awk sed tail tput date stat sort grep find timeout; do
     command -v "$cmd" >/dev/null 2>&1 || MISSING+=("$cmd")
 done
 if [ "${#MISSING[@]}" -gt 0 ]; then
@@ -308,9 +333,16 @@ declare -A DV=()        # display strings ("n/a" when the build lacks the key)
 declare -A CTR_ALT=()   # which alternative key each counter resolved from
 declare -A PREV_VAL=()  # previous snapshot value per counter (delta engine)
 declare -A DELTA=()     # "+N since last stats tick" per counter
+declare -A CTR_OFF=()   # continuity offsets: lifetime kept across Suricata resets
 STATS_RESOLVED=0        # counters resolved from the last dump-counters reply
 STATS_NA=0              # counters this build does not expose
 STATS_WARN=0            # 1 = dump-counters gave us nothing usable
+
+# Lifetime counters whose value must keep counting across Suricata restarts.
+# When such a counter comes back lower than before, the old lifetime is added
+# as an offset, so the adjusted (monotonic) total used by the rate engine and
+# the live totals never jumps backwards.
+RESET_KEYS="|PKTS|BYTES|ALERTS|KERNEL_PKTS|KERNEL_DROPS|ARP_PKTS|TOTAL_FLOWS|F_TCP|F_UDP|F_ICMP4|F_ICMP6|"
 
 # Counters that show a live "+N" delta in their section.
 DELTA_KEYS="|PKTS|BYTES|DEC_INVALID|ARP_PKTS|IPV4_PKTS|IPV6_PKTS|TCP_PKTS|UDP_PKTS|ICMP_PKTS|KERNEL_PKTS|KERNEL_DROPS|KERNEL_IFDROPS|ACTIVE_FLOWS|TOTAL_FLOWS|F_TCP|F_UDP|F_ICMP4|F_ICMP6|FLOW_MEMCAP|FLOW_EMERGENCY|FLOW_EVICTED|BYP_LOCAL|BYP_CAP|BYP_PKTS|BYP_CLOSED|IPS_ACCEPTED|IPS_BLOCKED|IPS_REJECTED|IPS_REPLACED|TCP_SYN|TCP_SYNACK|TCP_RST|TCP_ACTIVE|TCP_SESS|MEMCAP_DROPS|SEG_MEMCAP|TCP_BAD_CSUM|STREAM_MIDSTREAM|TCP_REASM_GAP|A_HTTP|A_TLS|A_DNS_TCP|A_DNS_UDP|A_QUIC|A_SSH|A_FTP|A_SMB|A_DHCP|A_NTP|A_DCERPC_TCP|A_DCERPC_UDP|AL_ERR|AL_GAP|AL_FAILED|FRAG_MEMCAP|FRAG_FRAGS|FRAG_REASM|FRAG_TIMEOUTS|ALERTS|DETECT_SUPPR|DETECT_QUEUE|"
@@ -320,6 +352,7 @@ for entry in "${COUNTER_MAP[@]}"; do
     printf -v "${entry%%:*}" '%s' 0
     DV["${entry%%:*}"]="n/a"
     CTR_ALT["${entry%%:*}"]="-"
+    CTR_OFF["${entry%%:*}"]=0
 done
 
 # ------------------------------------------------------------------------------
@@ -334,7 +367,7 @@ UPTIME=0
 RULES_LOADED=0
 RULES_CACHE=0
 JSON_DATA=""
-SOCKET_STATUS="UNKNOWN"
+SOCKET_STATUS="UNKNOWN"     # UNKNOWN | OK | BUSY | FAILED
 SURICATA_VERSION="UNKNOWN"
 NOW_TS=0
 FMT_OUT=""
@@ -345,6 +378,41 @@ PAUSED=0
 FORCE_REFRESH=0
 INTERACTIVE=0
 STTY_SAVE=""
+
+# SOCKET BUSY / FALLBACK STATE
+SC_T="$SOCKET_TIMEOUT"       # timeout (s) used by the next suricatasc call
+SOCKET_FRESH=0               # 1 = this cycle got a brand new counters reply
+SOCKET_BUSY_SINCE=0          # ms timestamp when the current busy episode began
+SOCKET_BUSY_FAILS=0          # failed probes in the current busy episode
+SOCKET_BUSY_TOTAL=0          # busy episodes since the dashboard started
+SOCKET_BUSY_LAST_S=0         # duration (s) of the last finished busy episode
+SOCKET_NEXT_PROBE=0          # ms timestamp of the next allowed probe while BUSY
+SOCKET_LAST_OK_TS=0          # ms timestamp of the last good counters reply
+SOCKET_RECOVERED_UNTIL=0     # show the "recovered" banner until this ms timestamp
+FETCH_REPLY=""
+UPTIME_C_TS=0                # ms timestamp when UPTIME_C was last refreshed
+SNAP_VALID=0                 # 1 once a real socket snapshot anchored the rates
+NIC_START_PKTS=0; NIC_START_BYTES=0
+
+# ---- continuity engine state --------------------------------------------------
+DATA_MODE="init"             # socket | nic | est : where displayed rates come from
+MODE_SWITCHES=0              # socket<->nic<->est switches since start
+MODE_SINCE=0                 # ms timestamp of the last mode switch
+EST_PPS="0.00"               # estimator-held pps (decayed while estimating)
+EST_MBIT="0.00"              # estimator-held Mbit/s (decayed while estimating)
+EST_LIVE_PKTS=0; EST_LIVE_BYTES=0   # totals extrapolated by the estimator
+NIC_LAST_MOVE_TS=0           # ms timestamp of the last real NIC counter movement
+NIC_FROZEN=0                 # 1 = NIC counters frozen (or /proc/net/dev gone)
+CACHE_PKTS=0; CACHE_BYTES=0  # traffic counted in another mode, merged back
+CACHE_MERGES=0               # how often the cache was merged into socket stats
+RESTARTS=0                   # Suricata lifetime-counter restarts seen
+
+SOCKET_CANDIDATES=(
+    /run/suricata/suricata-command.socket
+    /var/run/suricata/suricata-command.socket
+    /run/suricata-command.socket
+    /var/run/suricata-command.socket
+)
 
 # EVE STATE
 EVE_EVENTS=0; EVE_THREATS=0; EVE_INFO=0
@@ -379,7 +447,7 @@ NIC_PKTS=0; NIC_BYTES=0; NIC_PREV_PKTS=0; NIC_PREV_BYTES=0; NIC_SEEN=0; NIC_OK=0
 PEAK=1          # rolling pps peak in HUNDREDTHS (floor 0.01 pps)
 PEAK_MB=1       # rolling Mbit/s peak in hundredths
 NEW_PEAK=1
-RATE_SRC="socket"
+RATE_SRC="none"
 CYCLE=0
 COUNTER_RESETS=0
 LAST_DECAY_CYCLE=-1
@@ -407,7 +475,7 @@ FIXED_PROTOS='["http","tls","dns_tcp","dns_udp","dns","quic","ssh","dhcp","ntp",
 OTHER_PROTOS=""
 
 BLOCK40='████████████████████████████████████████'
-EMPTY40='░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░'
+EMPTY40='░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░'
 GRAPH_MAX=40
 TERM_W=100
 LOAD_LABEL="NORMAL"
@@ -507,6 +575,10 @@ read -r -d '' JQ_FIND_RULES <<'EOF'
 | if length > 0 then max else 0 end
 EOF
 
+read -r -d '' JQ_NOK <<'EOF'
+type == "object" and ((.return? // "OK") == "NOK")
+EOF
+
 read -r -d '' JQ_EVE_STREAM <<'EOF'
 def san: tostring | gsub("[^ -~]"; "?");
 def is_info:
@@ -585,6 +657,13 @@ EOF
 
 read -r -d '' AWK_DECAY <<'EOF'
 BEGIN { printf "%.2f %.2f %.2f %.2f %.2f %.2f", a*f, b*f, c*f, d*f, e*f, g*f }
+EOF
+
+read -r -d '' AWK_EST <<'EOF'
+BEGIN {
+    s = ms / 1000; if (s <= 0) s = 1
+    printf "%.0f %.0f\n", pps * s, mbit * 1000000 / 8 * s
+}
 EOF
 
 read -r -d '' AWK_HPDROP <<'EOF'
@@ -836,13 +915,17 @@ update_term_width() {
     TERM_W="$w"
 }
 
+# ------------------------------------------------------------------------------
+# SOCKET ACCESS  (every call is wrapped in `timeout`: a busy socket can never
+# hang the dashboard. The timeout in seconds comes from the global SC_T.)
+# ------------------------------------------------------------------------------
 sc_raw() {
     local command="${1:-}"
     [ -n "$command" ] || return 1
     if [ -n "${SOCKET:-}" ]; then
-        suricatasc -c "$command" "$SOCKET" 2>/dev/null
+        timeout --foreground -k 1 "$SC_T" suricatasc -c "$command" "$SOCKET" 2>/dev/null
     else
-        suricatasc -c "$command" 2>/dev/null
+        timeout --foreground -k 1 "$SC_T" suricatasc -c "$command" 2>/dev/null
     fi
 }
 
@@ -875,22 +958,153 @@ PYEOF
 }
 
 # ------------------------------------------------------------------------------
-# SOCKET DISCOVERY
+# SOCKET DISCOVERY + BUSY STATE MACHINE
+#   OK      socket answers, fresh Suricata data every cycle
+#   BUSY    Suricata process is alive but the socket does not answer (it is
+#           busy inspecting packets): last snapshot frozen, NIC fallback live,
+#           periodic re-probe, automatic switch back to OK
+#   FAILED  Suricata is not running (or the socket can never be found)
 # ------------------------------------------------------------------------------
+suricata_running() {
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -x "Suricata-Main" >/dev/null 2>&1 && return 0
+        pgrep -x "suricata" >/dev/null 2>&1 && return 0
+        pgrep -f "suricata -c" >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    grep -qsx -e "Suricata-Main" -e "suricata" /proc/[0-9]*/comm 2>/dev/null
+}
+
+# Candidate socket files, most specific first, de-duplicated.
+list_socket_paths() {
+    local p
+    {
+        [ -n "$SOCKET_USER" ] && printf '%s\n' "$SOCKET_USER"
+        for p in "${SOCKET_CANDIDATES[@]}"; do
+            [ -S "$p" ] && printf '%s\n' "$p"
+        done
+        find /run /var/run -maxdepth 3 -type s -iname '*suricata*' 2>/dev/null
+    } | awk '!seen[$0]++'
+}
+
+# A socket "responds" when a cheap `version` command returns something sane.
+# Uses the timeout currently held in SC_T.
+test_raw_socket() {
+    local path="${1:-}" out saved="${SOCKET:-}"
+    SOCKET="$path"
+    out="$(sc_raw version 2>/dev/null)"
+    SOCKET="$saved"
+    [ -n "$out" ] || return 1
+    printf '%s' "$out" | grep -qiE 'version|"return" *: *"OK"|success'
+}
+
+find_socket_path() {
+    local p
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        if test_raw_socket "$p"; then SOCKET="$p"; return 0; fi
+    done < <(list_socket_paths)
+    return 1
+}
+
 discover_socket() {
-    # (Zie de volledige implementatie van test_raw_socket, stap 1 t/m 3 voor socket discovery en de Unit 8200 bypass in de gelinkte broncode)
-    # Als de socket bezet is maar het proces draait en logs schrijft, wordt SOCKET_STATUS="OK" ingesteld.
-    if pgrep -x "Suricata-Main" >/dev/null 2>&1 || pgrep -f "suricata -c" >/dev/null 2>&1; then
-        if [ -f "$EVE_LOG" ] || [ -f "$FAST_LOG" ]; then
-            [ -z "${SOCKET:-}" ] && SOCKET="/run/suricata/suricata-command.socket"
-            SOCKET_STATUS="OK"
-            return 0
-        fi
+    SC_T="$SOCKET_BUSY_TIMEOUT"
+    if find_socket_path; then
+        SOCKET_STATUS="OK"
+        return 0
+    fi
+    if suricata_running; then
+        # Suricata is alive: the socket is simply not answering right now.
+        [ -z "${SOCKET:-}" ] && SOCKET="$(list_socket_paths | head -n 1)"
+        SOCKET_STATUS="BUSY"
+        return 0
     fi
     SOCKET_STATUS="FAILED"
     return 1
 }
 
+# Enter / stay in the BUSY state and schedule the next probe.
+mark_busy() {
+    if [ "$SOCKET_BUSY_SINCE" -eq 0 ]; then
+        SOCKET_BUSY_SINCE="$NOW_TS"
+        SOCKET_BUSY_TOTAL=$(( SOCKET_BUSY_TOTAL + 1 ))
+        SOCKET_BUSY_FAILS=0
+    fi
+    SOCKET_STATUS="BUSY"
+    SOCKET_BUSY_FAILS=$(( SOCKET_BUSY_FAILS + 1 ))
+    SOCKET_NEXT_PROBE=$(( NOW_TS + SOCKET_RETRY_S * 1000 ))
+}
+
+# Fetch a counters reply. Returns 0 only for a usable reply; a timeout, empty
+# output or a {"return":"NOK"} answer all count as "socket busy".
+socket_fetch_counters() {
+    local reply
+    FETCH_REPLY=""
+    reply="$(sc_json dump-counters 2>/dev/null)" || return 1
+    [ -n "$reply" ] || return 1
+    if printf '%s\n' "$reply" | jq -e "$JQ_NOK" >/dev/null 2>&1; then
+        return 1
+    fi
+    FETCH_REPLY="$reply"
+    return 0
+}
+
+# One state-machine step per cycle: sets SOCKET_STATUS and SOCKET_FRESH.
+socket_update() {
+    local probe=1 recovered=0 p
+    SOCKET_FRESH=0
+
+    case "$SOCKET_STATUS" in
+        OK)
+            ;;
+        BUSY)
+            # Do not hammer a busy socket: probe only when the retry timer expired.
+            [ "$NOW_TS" -lt "$SOCKET_NEXT_PROBE" ] && probe=0
+            ;;
+        *)
+            discover_socket
+            get_now_ms
+            case "$SOCKET_STATUS" in
+                FAILED) SOCKET_BUSY_SINCE=0; return 0 ;;
+                BUSY)   mark_busy; return 0 ;;
+            esac
+            ;;
+    esac
+
+    [ "$probe" -eq 1 ] || return 0
+
+    if [ "$SOCKET_STATUS" = "BUSY" ]; then SC_T="$SOCKET_BUSY_TIMEOUT"; else SC_T="$SOCKET_TIMEOUT"; fi
+
+    if socket_fetch_counters; then
+        get_now_ms
+        JSON_DATA="$FETCH_REPLY"
+        SOCKET_FRESH=1
+        SOCKET_LAST_OK_TS="$NOW_TS"
+        if [ "$SOCKET_BUSY_SINCE" -gt 0 ]; then
+            SOCKET_BUSY_LAST_S=$(( (NOW_TS - SOCKET_BUSY_SINCE) / 1000 ))
+            SOCKET_RECOVERED_UNTIL=$(( NOW_TS + 15000 ))
+            recovered=1
+        fi
+        SOCKET_STATUS="OK"; SOCKET_BUSY_SINCE=0; SOCKET_BUSY_FAILS=0
+        SC_T="$SOCKET_TIMEOUT"
+        [ "$SURICATA_VERSION" = "UNKNOWN" ] && get_suricata_version
+        [ "$recovered" -eq 1 ] && get_rules_loaded
+    else
+        get_now_ms
+        if suricata_running; then
+            # Suricata may have restarted with a new socket file: re-aim.
+            if [ -z "${SOCKET:-}" ] || [ ! -S "$SOCKET" ]; then
+                p="$(list_socket_paths | head -n 1)"
+                [ -n "$p" ] && SOCKET="$p"
+            fi
+            mark_busy
+        else
+            SOCKET_STATUS="FAILED"; SOCKET_BUSY_SINCE=0
+        fi
+    fi
+    SC_T="$SOCKET_TIMEOUT"
+    return 0
+}
 
 get_suricata_version() {
     local data value
@@ -902,7 +1116,9 @@ get_suricata_version() {
 }
 
 # ------------------------------------------------------------------------------
-# COUNTER PARSING  (also feeds the per-counter delta engine)
+# COUNTER PARSING  (also feeds the per-counter delta engine and the
+# continuity offsets: a lifetime counter that restarts from a lower value
+# keeps its previous lifetime as an offset so the totals keep counting)
 # ------------------------------------------------------------------------------
 parse_counters() {
     local line k rest v alt prev
@@ -927,13 +1143,26 @@ parse_counters() {
                 continue
             fi
         fi
+
+        prev="${PREV_VAL[$k]:-}"
+        if [ -n "$prev" ] && [ "$v" -lt "$prev" ]; then
+            # ---- continuity: Suricata restarted / counter reset --------------
+            # Keep counting: add the whole observed lifetime as an offset so the
+            # adjusted total is monotonic. Raw value still displayed per counter.
+            case "$RESET_KEYS" in
+                *"|$k|"*)
+                    CTR_OFF[$k]=$(( ${CTR_OFF[$k]:-0} + prev ))
+                    RESTARTS=$(( RESTARTS + 1 ))
+                    ;;
+            esac
+        fi
+
         printf -v "$k" '%s' "$v"
         CTR_ALT[$k]="$alt"
 
         # Delta engine: "+N" only when the snapshot value genuinely grew.
         # Repeated identical snapshots produce no delta; a reset (v < prev)
         # is not shown as a negative delta, PREV just re-anchors.
-        prev="${PREV_VAL[$k]:-}"
         if [ -n "$prev" ] && [ "$v" -gt "$prev" ]; then
             DELTA[$k]=$(( v - prev ))
         else
@@ -1002,9 +1231,15 @@ sync_uptime() {
     fi
 }
 
+# Uptime keeps ticking while the socket is busy (interpolated from the last
+# good snapshot instead of freezing).
 resolve_uptime() {
     if [ "${UPTIME_C:-0}" -gt 0 ]; then
-        UPTIME="$UPTIME_C"
+        if [ "$SOCKET_FRESH" = "1" ] || [ "$UPTIME_C_TS" -le 0 ]; then
+            UPTIME="$UPTIME_C"
+        else
+            UPTIME=$(( UPTIME_C + (NOW_TS - UPTIME_C_TS) / 1000 ))
+        fi
     elif [ "$UPTIME_BASE_TS" -gt 0 ]; then
         UPTIME=$(( UPTIME_BASE + (NOW_TS - UPTIME_BASE_TS) / 1000 ))
     else
@@ -1026,27 +1261,35 @@ show_other_protos() {
     printf '%s\n' "$OTHER_PROTOS" | awk -F'\t' -v max=18 "$AWK_OTHER"
 }
 
+# Effective (adjusted, monotonic) counters used by the rate engine and the
+# live totals. CTR_OFF keeps these counting across Suricata restarts, so a
+# switch between socket and NIC data can never make them jump backwards.
 compute_effective() {
     if [ "${PKTS:-0}" -gt 0 ]; then
-        EFF_PKTS="$PKTS"; PKT_SRC="decoder.pkts"
+        EFF_PKTS=$(( PKTS + ${CTR_OFF[PKTS]:-0} )); PKT_SRC="decoder.pkts"
     else
         EFF_PKTS=$(( ${TCP_PKTS:-0} + ${UDP_PKTS:-0} + ${ICMP_PKTS:-0} + ${ARP_PKTS:-0} + ${IPV6_PKTS:-0} ))
         PKT_SRC="proto-sum"
     fi
 
     if [ "${BYTES:-0}" -gt 0 ]; then
-        EFF_BYTES="$BYTES"; BYTE_SRC="decoder.bytes"
+        EFF_BYTES=$(( BYTES + ${CTR_OFF[BYTES]:-0} )); BYTE_SRC="decoder.bytes"
     else
         EFF_BYTES=0; BYTE_SRC="none"
     fi
 
     if [ "${TOTAL_FLOWS:-0}" -gt 0 ]; then
-        EFF_FLOWS="$TOTAL_FLOWS"; FLOW_SRC="flow.total"
+        EFF_FLOWS=$(( TOTAL_FLOWS + ${CTR_OFF[TOTAL_FLOWS]:-0} )); FLOW_SRC="flow.total"
     else
         EFF_FLOWS=$(( ${F_TCP:-0} + ${F_UDP:-0} ))
         FLOW_SRC="flow.proto-sum"
     fi
 }
+
+# Adjusted (monotonic) values of the other rate-engine anchors.
+adj_alerts()  { printf '%s' $(( ${ALERTS:-0}       + ${CTR_OFF[ALERTS]:-0} )); }
+adj_drops()   { printf '%s' $(( ${KERNEL_DROPS:-0} + ${CTR_OFF[KERNEL_DROPS]:-0} )); }
+adj_arp()     { printf '%s' $(( ${ARP_PKTS:-0}     + ${CTR_OFF[ARP_PKTS]:-0} )); }
 
 # ------------------------------------------------------------------------------
 # HEALTH ENGINE
@@ -1054,6 +1297,10 @@ compute_effective() {
 #   counters (lifetime totals never penalize) and stay active for
 #   HEALTH_HOLD_S seconds so a problem seen at one stats tick is visible for
 #   more than a single refresh. Recovery is automatic.
+#   A BUSY socket does not zero the score: counters are frozen, so no new
+#   penalties are raised, existing holds still run out, and "socket-busy" is
+#   listed as a reason. Mode switches never penalize either (continuity is
+#   handled by the rate engine, not the health engine).
 # ------------------------------------------------------------------------------
 hp_bump() {   # name points text
     HP_UNTIL[$1]=$(( NOW_TS + HEALTH_HOLD_S * 1000 ))
@@ -1073,31 +1320,33 @@ delta_pos() {
 compute_health() {
     local score=100 reasons="" name pen pct dd dp
 
-    if [ "$SOCKET_STATUS" != "OK" ]; then
-        HEALTH_PCT=0; HEALTH_REASONS="socket-offline; "
-        return
-    fi
+    case "$SOCKET_STATUS" in
+        OK|BUSY) ;;
+        *) HEALTH_PCT=0; HEALTH_REASONS="socket-offline; "; return ;;
+    esac
 
-    if [ "$PH_INIT" = "1" ]; then
-        dd=$(( KERNEL_DROPS - PH_KD ))
-        dp=$(( KERNEL_PKTS  - PH_KP ))
-        if [ "$dd" -gt 0 ]; then
-            read -r pen pct <<< "$(awk -v d="$dd" -v p="$dp" "$AWK_HPDROP")"
-            DROP_PCT_NOW="$pct"
-            hp_bump capture-drop "$pen" "capture-drop ${pct}%"
+    if [ "$SOCKET_STATUS" = "OK" ] && [ "$SOCKET_FRESH" = "1" ]; then
+        if [ "$PH_INIT" = "1" ]; then
+            dd=$(( KERNEL_DROPS - PH_KD ))
+            dp=$(( KERNEL_PKTS  - PH_KP ))
+            if [ "$dd" -gt 0 ]; then
+                read -r pen pct <<< "$(awk -v d="$dd" -v p="$dp" "$AWK_HPDROP")"
+                DROP_PCT_NOW="$pct"
+                hp_bump capture-drop "$pen" "capture-drop ${pct}%"
+            fi
         fi
-    fi
-    PH_KD="$KERNEL_DROPS"; PH_KP="$KERNEL_PKTS"; PH_INIT=1
+        PH_KD="$KERNEL_DROPS"; PH_KP="$KERNEL_PKTS"; PH_INIT=1
 
-    delta_pos flow-emergency       "$FLOW_EMERGENCY"  && hp_bump flow-emergency       20
-    delta_pos flow-memcap          "$FLOW_MEMCAP"     && hp_bump flow-memcap          10
-    delta_pos ssn-memcap-drop      "$MEMCAP_DROPS"    && hp_bump ssn-memcap-drop      10
-    delta_pos segment-memcap-drop  "$SEG_MEMCAP"      && hp_bump segment-memcap-drop   5
-    delta_pos frag-memcap          "$FRAG_MEMCAP"     && hp_bump frag-memcap           5
-    delta_pos alert-queue-overflow "$DETECT_QUEUE"    && hp_bump alert-queue-overflow  5
-    delta_pos app-layer-errors     "$AL_ERR"          && hp_bump app-layer-errors      3
-    delta_pos frag-timeouts        "$FRAG_TIMEOUTS"   && hp_bump frag-timeouts         2
-    delta_pos bad-checksums        "$TCP_BAD_CSUM"    && hp_bump bad-checksums         2
+        delta_pos flow-emergency       "$FLOW_EMERGENCY"  && hp_bump flow-emergency       20
+        delta_pos flow-memcap          "$FLOW_MEMCAP"     && hp_bump flow-memcap          10
+        delta_pos ssn-memcap-drop      "$MEMCAP_DROPS"    && hp_bump ssn-memcap-drop      10
+        delta_pos segment-memcap-drop  "$SEG_MEMCAP"      && hp_bump segment-memcap-drop   5
+        delta_pos frag-memcap          "$FRAG_MEMCAP"     && hp_bump frag-memcap           5
+        delta_pos alert-queue-overflow "$DETECT_QUEUE"    && hp_bump alert-queue-overflow  5
+        delta_pos app-layer-errors     "$AL_ERR"          && hp_bump app-layer-errors      3
+        delta_pos frag-timeouts        "$FRAG_TIMEOUTS"   && hp_bump frag-timeouts         2
+        delta_pos bad-checksums        "$TCP_BAD_CSUM"    && hp_bump bad-checksums        2
+    fi
 
     for name in "${HP_ORDER[@]}"; do
         if hp_active "$name"; then
@@ -1105,6 +1354,12 @@ compute_health() {
             reasons+="${HP_TXT[$name]:-$name}; "
         fi
     done
+    if [ "$SOCKET_STATUS" = "BUSY" ]; then
+        reasons+="socket-busy (${DATA_MODE} fallback); "
+    fi
+    if [ "$RESTARTS" -gt 0 ]; then
+        reasons+="suricata-restarts=${RESTARTS} (offsets keep totals); "
+    fi
     if [ "$COUNTER_RESETS" -gt 0 ]; then
         reasons+="counter-resets=${COUNTER_RESETS}; "
     fi
@@ -1122,13 +1377,24 @@ set_health_color() {
 }
 
 # ------------------------------------------------------------------------------
-# RATE ENGINE + LIVE TOTALS
-#   * Socket rates are computed over the real time between stats snapshots.
-#   * Once the snapshot goes stale, held rates DECAY (RATE_DECAY per cycle) so
-#     they fall when traffic lowers instead of freezing.
-#   * pps/Mbit fall back to live NIC counters between ticks.
-#   * LIVE_PKTS / LIVE_BYTES interpolate the totals between snapshots so the
-#     total packet counter updates EVERY refresh (default: every 2s).
+# RATE ENGINE + LIVE TOTALS + CONTINUITY
+#   Data mode (DATA_MODE): where the displayed pps/Mbit come from this cycle.
+#     socket  fresh Suricata snapshot (rates over the real snapshot interval;
+#             after a busy/est window this is the AVERAGE over that window,
+#             so switching back can never spike)
+#     nic     live /proc/net/dev counters (socket busy or between ticks)
+#     est     ${EST_LABEL} estimator: socket busy AND the NIC counters are
+#             frozen/unreadable too. Rates are held and decayed, totals are
+#             extrapolated at the decayed rate so nothing freezes or spikes.
+#   Continuity guarantees:
+#     * EFF_* / adjusted anchors are MONOTONIC (offsets across Suricata
+#       restarts), so no switch can make a rate or total jump backwards.
+#     * LIVE_PKTS / LIVE_BYTES never decrease. When a fresh socket snapshot
+#       arrives, the engine anchors at max(socket value, cached live value):
+#       everything counted on the NIC / estimator while the socket was busy
+#       is merged back into the socket stats instead of being thrown away.
+#     * Held rates decay smoothly in every non-fresh mode (RATE_DECAY), so
+#       displayed values lower naturally when traffic lowers.
 # ------------------------------------------------------------------------------
 peak_roll() {   # $1 = current, $2 = peak, $3 = floor -> NEW_PEAK
     local cur="$1" peak="$2" floor="$3"
@@ -1143,40 +1409,75 @@ peak_roll() {   # $1 = current, $2 = peak, $3 = floor -> NEW_PEAK
 }
 
 # Live NIC totals from /proc/net/dev. Always up to date, regardless of how
-# often Suricata refreshes its stats snapshot.
+# often Suricata refreshes its stats snapshot (or whether its socket answers).
 read_iface_stats() {
     awk -v inc="$NIC_IFACES" "$AWK_IFACE" /proc/net/dev 2>/dev/null || echo "0 0"
 }
 
-calculate_all_rates() {
-    local changed=0 dt out np nm pr mb elapsed d
+# Smooth mode switch bookkeeping (shown in the health section).
+set_data_mode() {
+    local m="$1"
+    [ "$m" = "$DATA_MODE" ] && return 0
+    DATA_MODE="$m"
+    MODE_SWITCHES=$(( MODE_SWITCHES + 1 ))
+    MODE_SINCE="$NOW_TS"
+}
 
+calculate_all_rates() {
+    local changed=0 anchor=0 dt out np nm pr mb elapsed d
+    local a_alerts a_drops a_arp base_pkts base_bytes nic_dp nic_db
+
+    a_alerts="$(adj_alerts)"; a_drops="$(adj_drops)"; a_arp="$(adj_arp)"
+
+    # ---- NIC counters: read and classify (fresh / frozen / gone) -------------
     [ -r /proc/net/dev ] && NIC_OK=1 || NIC_OK=0
     read -r NIC_PKTS NIC_BYTES <<< "$(read_iface_stats)"
     NIC_PKTS="$(safe_int "$NIC_PKTS")"; NIC_BYTES="$(safe_int "$NIC_BYTES")"
+    if [ "$NIC_SEEN" -eq 0 ]; then
+        NIC_START_PKTS="$NIC_PKTS"; NIC_START_BYTES="$NIC_BYTES"
+        NIC_LAST_MOVE_TS="$NOW_TS"
+    fi
+    if [ "$NIC_OK" -eq 0 ]; then
+        NIC_FROZEN=1
+    elif [ "$NIC_PKTS" -ne "$NIC_PREV_PKTS" ] || [ "$NIC_BYTES" -ne "$NIC_PREV_BYTES" ]; then
+        NIC_FROZEN=0
+        NIC_LAST_MOVE_TS="$NOW_TS"
+    elif [ $(( NOW_TS - NIC_LAST_MOVE_TS )) -ge $(( NIC_STALE_S * 1000 )) ]; then
+        NIC_FROZEN=1
+    fi
 
     # ---- socket snapshot: did Suricata publish new numbers? -----------------
-    if [ "$SNAP_TS" -eq 0 ]; then
+    # (compared on the ADJUSTED values: a Suricata restart no longer counts as
+    #  a "reset" here because the offsets keep the adjusted totals monotonic)
+    if [ "$SNAP_VALID" -eq 0 ]; then
+        # No real Suricata snapshot seen yet: the first fresh one is only a
+        # baseline (no rate from it, otherwise lifetime counters / tiny dt).
         SNAP_TS="$NOW_TS"
-    elif [ "$EFF_PKTS" -lt "$SNAP_PKTS" ] || [ "${ALERTS:-0}" -lt "$SNAP_ALERTS" ] \
+        if [ "$SOCKET_FRESH" = "1" ]; then SNAP_VALID=1; anchor=1; fi
+    elif [ "$EFF_PKTS" -lt "$SNAP_PKTS" ] || [ "$a_alerts" -lt "$SNAP_ALERTS" ] \
          || [ "$PKT_SRC" != "$SNAP_PKT_SRC" ]; then
-        COUNTER_RESETS=$(( COUNTER_RESETS + 1 ))     # restart / source change
+        # Source changed (e.g. decoder.pkts became available): re-anchor only
+        # the rate baseline, the live totals stay monotonic via the merge below.
         SNAP_TS="$NOW_TS"
+        anchor=1
     elif [ "$EFF_PKTS" != "$SNAP_PKTS" ] || [ "$EFF_BYTES" != "$SNAP_BYTES" ] \
-         || [ "$EFF_FLOWS" != "$SNAP_FLOWS" ] || [ "${ALERTS:-0}" != "$SNAP_ALERTS" ] \
-         || [ "${KERNEL_DROPS:-0}" != "$SNAP_DROPS" ]; then
+         || [ "$EFF_FLOWS" != "$SNAP_FLOWS" ] || [ "$a_alerts" != "$SNAP_ALERTS" ] \
+         || [ "$a_drops" != "$SNAP_DROPS" ]; then
         changed=1
     fi
 
     if [ "$changed" -eq 1 ]; then
         dt=$(( NOW_TS - SNAP_TS )); [ "$dt" -lt 1 ] && dt=1
+        # dt is the REAL time since the last usable data point (which may be
+        # many refresh cycles ago if the socket was busy / NIC frozen): the
+        # resulting rates are averages over the whole window - no spikes.
         out="$(awk -v ms="$dt" \
             -v cp="$EFF_PKTS"  -v pp="$SNAP_PKTS" \
             -v cb="$EFF_BYTES" -v pb="$SNAP_BYTES" \
             -v cf="$EFF_FLOWS" -v pf="$SNAP_FLOWS" \
-            -v ca="${ALERTS:-0}"       -v pa="$SNAP_ALERTS" \
-            -v cd="${KERNEL_DROPS:-0}" -v pd="$SNAP_DROPS" \
-            -v carp="${ARP_PKTS:-0}"   -v parp="$SNAP_ARP" "$AWK_RATES" 2>/dev/null)"
+            -v ca="$a_alerts"       -v pa="$SNAP_ALERTS" \
+            -v cd="$a_drops"        -v pd="$SNAP_DROPS" \
+            -v carp="$a_arp"        -v parp="$SNAP_ARP" "$AWK_RATES" 2>/dev/null)"
         if [ -n "$out" ]; then
             read -r SOCK_PPS SOCK_MBIT SOCK_DROPS SOCK_ALERTS SOCK_FLOWS SOCK_ARPR <<< "$out"
         fi
@@ -1184,14 +1485,15 @@ calculate_all_rates() {
         SNAP_TS="$NOW_TS"
     fi
     SNAP_PKTS="$EFF_PKTS"; SNAP_BYTES="$EFF_BYTES"; SNAP_FLOWS="$EFF_FLOWS"
-    SNAP_ALERTS="${ALERTS:-0}"; SNAP_DROPS="${KERNEL_DROPS:-0}"; SNAP_PKT_SRC="$PKT_SRC"
-    SNAP_ARP="${ARP_PKTS:-0}"
+    SNAP_ALERTS="$a_alerts"; SNAP_DROPS="$a_drops"; SNAP_PKT_SRC="$PKT_SRC"
+    SNAP_ARP="$a_arp"
 
-    # ---- decay stale held rates once per cycle ------------------------------
-    # Between stats snapshots (or after Suricata stops reporting traffic) the
-    # held socket rates decay smoothly toward 0 so displayed values LOWER when
-    # traffic lowers, instead of freezing at the last snapshot rate.
-    if [ "$NOW_TS" -gt "$SOCK_UNTIL" ] && [ "$LAST_DECAY_CYCLE" != "$CYCLE" ]; then
+    # ---- one decay engine for all held rates --------------------------------
+    # Runs whenever the current rates are not backed by a fresh data point
+    # (between stats ticks, socket busy, NIC frozen): every held rate decays
+    # smoothly toward 0 so displayed values LOWER when traffic lowers.
+    if [ "$NOW_TS" -gt "$SOCK_UNTIL" ] && [ "$LAST_DECAY_CYCLE" != "$CYCLE" ] \
+       && [ "$changed" -eq 0 ]; then
         out="$(awk -v f="$RATE_DECAY" -v a="$SOCK_PPS" -v b="$SOCK_MBIT" \
                     -v c="$SOCK_DROPS" -v d="$SOCK_ALERTS" -v e="$SOCK_FLOWS" -v g="$SOCK_ARPR" \
                "$AWK_DECAY")"
@@ -1199,41 +1501,91 @@ calculate_all_rates() {
         LAST_DECAY_CYCLE="$CYCLE"
     fi
 
-    # ---- alerts / drops / flows / arp rates: fresh, held, or decaying --------
+    # ---- alerts / drops / flows / arp rates: held socket rates (decaying) ----
     ALERT_RATE="$SOCK_ALERTS"; DROP_RATE="$SOCK_DROPS"; FLOW_RATE="$SOCK_FLOWS"
     ARP_RATE="$SOCK_ARPR"
 
-    # ---- pps / Mbit/s: fresh socket data, else live NIC counters -----------
-    RATE_SRC="socket"
+    # ---- pps / Mbit/s: pick the data mode for this cycle --------------------
     PKT_RATE="0.00"; MBIT_RATE="0.00"
     if [ "$changed" -eq 1 ] && awk -v a="$SOCK_PPS" -v b="$SOCK_MBIT" 'BEGIN { exit !(a+0 > 0 || b+0 > 0) }'; then
+        # fresh socket data
         PKT_RATE="$SOCK_PPS"; MBIT_RATE="$SOCK_MBIT"
-    elif [ "$NIC_SEEN" -eq 1 ] && [ "$NIC_OK" -eq 1 ]; then
+        RATE_SRC="socket"
+        set_data_mode "socket"
+        EST_PPS="$PKT_RATE"; EST_MBIT="$MBIT_RATE"
+    elif [ "$NIC_OK" -eq 1 ] && [ "$NIC_FROZEN" -eq 0 ] && [ "$NIC_SEEN" -eq 1 ]; then
+        # live NIC counters (socket busy or between stats ticks)
         elapsed=$(( NOW_TS - PREV_TS )); [ "$elapsed" -lt 50 ] && elapsed=1000
         out="$(awk -v ms="$elapsed" -v cp="$NIC_PKTS" -v pp="$NIC_PREV_PKTS" \
                    -v cb="$NIC_BYTES" -v pb="$NIC_PREV_BYTES" "$AWK_NIC")"
         read -r np nm <<< "$out"
         PKT_RATE="${np:-0.00}"; MBIT_RATE="${nm:-0.00}"
-        RATE_SRC="nic (/proc/net/dev)"
+        if [ "$SOCKET_STATUS" = "BUSY" ]; then
+            RATE_SRC="nic (socket busy)"
+        else
+            RATE_SRC="nic (/proc/net/dev)"
+        fi
+        set_data_mode "nic"
+        EST_PPS="$PKT_RATE"; EST_MBIT="$MBIT_RATE"
     else
+        # ---- ${EST_LABEL} estimator: NIC busy/gone AND no fresh socket data.
+        # Rates decay smoothly (the decay engine above already ran on the
+        # held rates) and the live totals are extrapolated at the decayed
+        # rate so the dashboard keeps counting, never freezes.
         PKT_RATE="$SOCK_PPS"; MBIT_RATE="$SOCK_MBIT"
-        RATE_SRC="socket (decaying)"
+        RATE_SRC="${EST_LABEL} est (nic busy)"
+        set_data_mode "est"
     fi
 
-    # ---- LIVE TOTALS: update every cycle (exact at snapshots, interpolated
-    #      between them from the NIC counters anchored at the last snapshot) --
-    if [ "$changed" -eq 1 ]; then
-        LAST_SNAP_EFF="$EFF_PKTS"; LAST_SNAP_EFF_B="$EFF_BYTES"
+    # ---- LIVE TOTALS: monotonic, merged across every mode switch -----------
+    # Anchor: a fresh socket snapshot anchors at max(socket, cached live) so
+    # traffic counted on the NIC / estimator while the socket was busy is
+    # merged back into the socket stats instead of being lost. Between
+    # snapshots the NIC delta interpolates; if the NIC is frozen too, the
+    # estimator extrapolates at the decayed rate.
+    if [ "$changed" -eq 1 ] || [ "$anchor" -eq 1 ]; then
+        base_pkts="$EFF_PKTS"; base_bytes="$EFF_BYTES"
+        if [ "$LIVE_OK" -eq 1 ]; then
+            # carry the cache: never drop below what we already showed
+            if [ "$LIVE_PKTS" -gt "$base_pkts" ]; then
+                CACHE_PKTS=$(( CACHE_PKTS + (LIVE_PKTS - base_pkts) ))
+                CACHE_MERGES=$(( CACHE_MERGES + 1 ))
+                base_pkts="$LIVE_PKTS"
+            fi
+            if [ "$LIVE_BYTES" -gt "$base_bytes" ]; then
+                CACHE_BYTES=$(( CACHE_BYTES + (LIVE_BYTES - base_bytes) ))
+                base_bytes="$LIVE_BYTES"
+            fi
+        fi
+        LAST_SNAP_EFF="$base_pkts"; LAST_SNAP_EFF_B="$base_bytes"
         NIC_SNAP_PKTS="$NIC_PKTS"; NIC_SNAP_BYTES="$NIC_BYTES"
         LIVE_OK=1
+        EST_LIVE_PKTS=0; EST_LIVE_BYTES=0
     fi
+
     if [ "$LIVE_OK" -eq 1 ]; then
         d=$(( NIC_PKTS - NIC_SNAP_PKTS ));  [ "$d" -lt 0 ] && d=0
         LIVE_PKTS=$(( LAST_SNAP_EFF + d ))
         d=$(( NIC_BYTES - NIC_SNAP_BYTES )); [ "$d" -lt 0 ] && d=0
         LIVE_BYTES=$(( LAST_SNAP_EFF_B + d ))
+        if [ "$DATA_MODE" = "est" ]; then
+            # NIC frozen too: extrapolate at the decayed estimator rate
+            elapsed=$(( NOW_TS - PREV_TS )); [ "$elapsed" -lt 50 ] && elapsed=1000
+            out="$(awk -v ms="$elapsed" -v pps="$PKT_RATE" -v mbit="$MBIT_RATE" "$AWK_EST")"
+            read -r nic_dp nic_db <<< "$out"
+            EST_LIVE_PKTS=$(( EST_LIVE_PKTS + nic_dp ))
+            EST_LIVE_BYTES=$(( EST_LIVE_BYTES + nic_db ))
+            LIVE_PKTS=$(( LIVE_PKTS + EST_LIVE_PKTS ))
+            LIVE_BYTES=$(( LIVE_BYTES + EST_LIVE_BYTES ))
+        fi
+        # monotonic guard (never drop, even if a data source disagrees)
+        [ "$LIVE_PKTS" -lt "$LIVE_PREV_PKTS" ] && LIVE_PKTS="$LIVE_PREV_PKTS"
+        [ "$LIVE_BYTES" -lt "$LIVE_PREV_BYTES" ] && LIVE_BYTES="$LIVE_PREV_BYTES"
     else
-        LIVE_PKTS="$LAST_SNAP_EFF"; LIVE_BYTES="$LAST_SNAP_EFF_B"
+        d=$(( NIC_PKTS - NIC_START_PKTS ));  [ "$d" -lt 0 ] && d=0
+        LIVE_PKTS="$d"
+        d=$(( NIC_BYTES - NIC_START_BYTES )); [ "$d" -lt 0 ] && d=0
+        LIVE_BYTES="$d"
     fi
     if [ "$LIVE_INIT" = "1" ]; then
         LIVE_DELTA_PKTS=$(( LIVE_PKTS - LIVE_PREV_PKTS ))
@@ -1248,9 +1600,9 @@ calculate_all_rates() {
     NIC_PREV_PKTS="$NIC_PKTS"; NIC_PREV_BYTES="$NIC_BYTES"; NIC_SEEN=1
 
     if [ "${DEBUG_RATES:-0}" = "1" ]; then
-        printf 'DEBUG cycle=%s changed=%s pkts=%s bytes=%s live=%s (+%s) nic=%s/%s => pps=%s mbit=%s arp=%s src=%s\n' \
-            "$CYCLE" "$changed" "$EFF_PKTS" "$EFF_BYTES" "$LIVE_PKTS" "$LIVE_DELTA_PKTS" \
-            "$NIC_PKTS" "$NIC_BYTES" "$PKT_RATE" "$MBIT_RATE" "$ARP_RATE" "$RATE_SRC" >&2
+        printf 'DEBUG cycle=%s mode=%s sock=%s fresh=%s changed=%s nicfrozen=%s pkts=%s bytes=%s live=%s (+%s) cache=%s/%s => pps=%s mbit=%s arp=%s src=%s\n' \
+            "$CYCLE" "$DATA_MODE" "$SOCKET_STATUS" "$SOCKET_FRESH" "$changed" "$NIC_FROZEN" "$EFF_PKTS" "$EFF_BYTES" "$LIVE_PKTS" "$LIVE_DELTA_PKTS" \
+            "$CACHE_PKTS" "$CACHE_MERGES" "$PKT_RATE" "$MBIT_RATE" "$ARP_RATE" "$RATE_SRC" >&2
     fi
 
     # Rolling peaks (hundredths) drive the auto-scaling bars.
@@ -1964,12 +2316,41 @@ show_eve_stats() {
     show_info_box
 }
 
+# Banner shown under the header while the socket is busy (and for a few
+# seconds after it came back). Explains the current fallback data mode.
+show_socket_banner() {
+    local since age next
+    if [ "$SOCKET_STATUS" = "BUSY" ]; then
+        since=0; age=0
+        [ "$SOCKET_BUSY_SINCE" -gt 0 ] && since=$(( (NOW_TS - SOCKET_BUSY_SINCE) / 1000 ))
+        next=$(( (SOCKET_NEXT_PROBE - NOW_TS + 999) / 1000 )); [ "$next" -lt 0 ] && next=0
+        printf '%s\n' "${YELLOW}${BOLD}[~] SURICATA SOCKET BUSY (inspecting packets) for ${since}s - ${DATA_MODE} fallback active${NC}"
+        if [ "$DATA_MODE" = "est" ]; then
+            printf '%s\n' "${YELLOW}    NIC counters busy too: ${EST_LABEL} estimator active - rates decay smoothly, totals keep counting.${NC}"
+        else
+            printf '%s\n' "${YELLOW}    pps, Mbit/s and the live totals now come from /proc/net/dev; EVE alerts and hardware keep refreshing.${NC}"
+        fi
+        if [ "$SOCKET_LAST_OK_TS" -gt 0 ]; then
+            age=$(( (NOW_TS - SOCKET_LAST_OK_TS) / 1000 ))
+            printf '%s\n' "${YELLOW}    Suricata snapshot cached (${age}s old, counters keep counting) | next socket probe in ${next}s | failed probes: ${SOCKET_BUSY_FAILS}${NC}"
+        else
+            printf '%s\n' "${YELLOW}    No Suricata snapshot received yet | next socket probe in ${next}s | failed probes: ${SOCKET_BUSY_FAILS}${NC}"
+        fi
+    elif [ "$SOCKET_RECOVERED_UNTIL" -gt "$NOW_TS" ]; then
+        printf '%s\n' "${GREEN}${BOLD}[+] Suricata socket answered again after ${SOCKET_BUSY_LAST_S}s - cached ${DATA_MODE} traffic merged back, counters kept counting${NC}"
+    elif [ "$DATA_MODE" = "est" ]; then
+        printf '%s\n' "${MAGENTA}${BOLD}[~] ${EST_LABEL^^} ESTIMATOR ACTIVE (NIC counters busy) - rates decay smoothly, totals keep counting${NC}"
+    fi
+}
+
 show_health() {
-    local status="OK" status_color="$GREEN" ver
+    local status="OK" status_color="$GREEN" ver sock_col="$CYAN"
     set_health_color
 
-    if [ "$SOCKET_STATUS" != "OK" ]; then
-        status="SOCKET OFFLINE"; status_color="$RED"
+    if [ "$SOCKET_STATUS" = "BUSY" ]; then
+        status="SOCKET BUSY (${DATA_MODE})"; status_color="$YELLOW"; sock_col="$YELLOW"
+    elif [ "$SOCKET_STATUS" != "OK" ]; then
+        status="SOCKET OFFLINE"; status_color="$RED"; sock_col="$RED"
     elif hp_active capture-drop; then
         status="CAPTURE DROPS"; status_color="$YELLOW"
     elif hp_active alert-queue-overflow; then
@@ -1980,8 +2361,8 @@ show_health() {
     ver="${SURICATA_VERSION:0:14}"
 
     section "SENSOR HEALTH"
-    row "Health:" "${HEALTH_PCT}% $status" "$HC${BOLD}" \
-        "Socket:" "$SOCKET_STATUS" "$CYAN" \
+    row "Health:" "${HEALTH_PCT}% ${status:0:10}" "$HC${BOLD}" \
+        "Socket:" "$SOCKET_STATUS" "$sock_col" \
         "Rate source:" "${RATE_SRC:0:14}" "$DIM"
     row "Suricata:" "$ver" "$CYAN" \
         "Alert queue:" "${DV[DETECT_QUEUE]}$(dd DETECT_QUEUE)" "$CYAN" \
@@ -2003,13 +2384,19 @@ show_health() {
     row "Drop ratio:" "$(kernel_drop_percent)" "$YELLOW" \
         "Last drop %:" "${DROP_PCT_NOW}%" "$YELLOW" \
         "Resets:" "$COUNTER_RESETS" "$CYAN"
+    row "Data mode:" "$DATA_MODE" "$CYAN" \
+        "Mode switches:" "$MODE_SWITCHES" "$CYAN" \
+        "SC restarts:" "$RESTARTS" "$CYAN"
+    row "Cache merged:" "+$(fmt_num "$CACHE_PKTS") pkts" "$GREEN" \
+        "Cache merges:" "$CACHE_MERGES" "$CYAN" \
+        "Busy episodes:" "$SOCKET_BUSY_TOTAL" "$YELLOW"
     row "Load:" "$LOAD_LABEL" "$CYAN" \
         "Refresh:" "${REFRESH_INTERVAL}s" "$CYAN" \
         "Health hold:" "${HEALTH_HOLD_S}s" "$CYAN"
 }
 
 # ------------------------------------------------------------------------------
-# CONNECTION ERROR
+# CONNECTION ERROR  (only shown when Suricata really is not reachable at all)
 # ------------------------------------------------------------------------------
 show_connection_error() {
     local rule
@@ -2017,7 +2404,11 @@ show_connection_error() {
     printf '%s\n' "${RED}${BOLD}${rule}${NC}"
     printf '%s\n' "${RED}${BOLD}               SURICATA IPS DASHBOARD [CRITICAL ERROR]${NC}"
     printf '%s\n' "${RED}${BOLD}${rule}${NC}"
-    printf '%s\n' "${YELLOW}[!] Unable to connect to the Suricata socket.${NC}"
+    if [ "$SOCKET_STATUS" = "BUSY" ]; then
+        printf '%s\n' "${YELLOW}[!] Suricata is running but its socket is busy (packet inspection) - retry shortly.${NC}"
+    else
+        printf '%s\n' "${YELLOW}[!] Unable to connect to the Suricata socket and no Suricata process was found.${NC}"
+    fi
     printf '%s\n' "    Make sure Suricata is running in IPS/IDS mode with the unix-command socket enabled."
     printf '%s\n' "    Socket status: ${WHITE}${SOCKET_STATUS:-UNKNOWN}${NC}"
     if [ -n "${SOCKET:-}" ]; then
@@ -2041,23 +2432,13 @@ show_connection_error() {
     fi
 }
 
-# Zoek het begin van het [CRITICAL ERROR] weergaveblok en zet dit bovenaan:
-#if pgrep -x "Suricata-Main" >/dev/null 2>&1 || pgrep -f "suricata -c" >/dev/null 2>&1; then
-#    # Zolang Suricata in het OS draait, weigeren we de error-pagina te tonen!
-#    SOCKET_STATUS="OK"
-#    STATS_WARN=0
-#    sleep 1
-#    continue
-#fi
-
-
 # ------------------------------------------------------------------------------
 # FRAME RENDERING
 # ------------------------------------------------------------------------------
 render_frame() {
     local rule rule_dash title pad_l pad_r pkt_bar mb_bar pk_peak mb_peak
-    local status_txt rules_txt bw_ok=1 mbit_disp eff_pk eff_by live_pk live_d
-    local live_by live_db inspect="OK"
+    local status_txt st_col rules_txt bw_ok=1 mbit_disp eff_pk eff_by live_pk live_d
+    local live_by live_db inspect="OK" snap_age
 
     set_health_color
     printf -v rule '%*s' "$TERM_W" ''
@@ -2068,7 +2449,11 @@ render_frame() {
     pad_l=$(( (TERM_W - ${#title}) / 2 ))
     pad_r=$(( TERM_W - ${#title} - pad_l ))
 
-    [ "$SOCKET_STATUS" = "OK" ] && status_txt="ACTIVE" || status_txt="OFFLINE"
+    case "$SOCKET_STATUS" in
+        OK)   status_txt="ACTIVE";      st_col="$GREEN" ;;
+        BUSY) status_txt="BUSY (NIC)";  st_col="$YELLOW" ;;
+        *)    status_txt="OFFLINE";     st_col="$RED" ;;
+    esac
     if [ "$RULES_LOADED" -gt 0 ]; then rules_txt="$RULES_LOADED"; else rules_txt="n/a"; fi
     [ "$HEALTH_PCT" -ge 90 ] || inspect="CHECK"
     pk_peak="$(hund "$PEAK")"; mb_peak="$(hund "$PEAK_MB")"
@@ -2077,7 +2462,8 @@ render_frame() {
     if [ "$BYTE_SRC" = "none" ] && [ "$NIC_OK" -eq 0 ]; then bw_ok=0; fi
     if [ "$bw_ok" -eq 1 ]; then mbit_disp="$MBIT_RATE"; else mbit_disp="n/a"; fi
 
-    # Live totals (update every cycle, interpolated between stats snapshots).
+    # Live totals (update every cycle, interpolated between stats snapshots,
+    # extrapolated by the estimator when the NIC is busy, never decreasing).
     num_commas "$LIVE_PKTS";  live_pk="$FMT_OUT"
     num_commas "$LIVE_DELTA_PKTS"; live_d="$FMT_OUT"
     bytes_h "$LIVE_BYTES"; live_by="$FMT_OUT"
@@ -2087,7 +2473,7 @@ render_frame() {
     printf '%s%*s%s%*s%s\n' "${BG_BLUE}${WHITE}${BOLD}" "$pad_l" "" "$title" "$pad_r" "" "$NC"
     printf '%s\n' "${BLUE}${BOLD}${rule}${NC}"
 
-    row "Status:" "$status_txt" "$GREEN" \
+    row "Status:" "$status_txt" "$st_col" \
         "Uptime:" "$(fmt_uptime "$UPTIME")" "$CYAN" \
         "Rules active:" "$rules_txt" "$YELLOW"
     row "Pps:" "$PKT_RATE" "$GREEN" \
@@ -2101,11 +2487,16 @@ render_frame() {
         "ARP rate:" "$ARP_RATE/s" "$CYAN"
     row "Alerts/s:" "$ALERT_RATE" "$RED" \
         "New flows/s:" "$FLOW_RATE" "$CYAN" \
-        "Rate source:" "${RATE_SRC:0:14}" "$DIM"
+        "Data mode:" "$DATA_MODE" "$CYAN"
     row "Suricata:" "${SURICATA_VERSION:0:14}" "$CYAN" \
         "Suridash:" "$Suridash_Version" "$CYAN" \
         "Refresh:" "${REFRESH_INTERVAL}s" "$CYAN"
-    if [ "$STATS_WARN" = "1" ]; then
+    show_socket_banner
+    if [ "$SOCKET_STATUS" = "BUSY" ]; then
+        snap_age="n/a"
+        [ "$SOCKET_LAST_OK_TS" -gt 0 ] && snap_age="$(( (NOW_TS - SOCKET_LAST_OK_TS) / 1000 ))s"
+        printf '%s\n' "${DIM}    stats: cached (last snapshot ${snap_age} ago) - totals keep counting from ${DATA_MODE} data${NC}"
+    elif [ "$STATS_WARN" = "1" ]; then
         printf '%s\n' "${YELLOW}${BOLD}[!] dump-counters replied but no counters could be parsed.${NC}"
         printf '%s\n' "${YELLOW}    Check: unix-command socket enabled in suricata.yaml, jq >= 1.5,${NC}"
         printf '%s\n' "${YELLOW}    and run: sudo $0 --debug-parse  (shows the raw reply + parse errors)${NC}"
@@ -2197,34 +2588,40 @@ collect_cycle() {
     CYCLE=$(( CYCLE + 1 ))
     get_now_ms
 
-    if [ "$SOCKET_STATUS" != "OK" ]; then
-        discover_socket && get_suricata_version
-    fi
-    if [ "$SOCKET_STATUS" = "OK" ]; then
-        JSON_DATA="$(sc_json dump-counters 2>/dev/null || true)"
-        get_now_ms
-        [ -n "$JSON_DATA" ] || SOCKET_STATUS="FAILED"
-    fi
-    if [ "$SOCKET_STATUS" != "OK" ]; then
+    # Talk to the socket (bounded by timeouts). Result: OK (fresh data),
+    # BUSY (cached snapshot + NIC/estimator fallback) or FAILED (not running).
+    socket_update
+    get_now_ms
+
+    if [ "$SOCKET_STATUS" != "OK" ] && [ "$SOCKET_STATUS" != "BUSY" ]; then
         update_term_width
         set_frame "$(show_connection_error)"
         return 1
     fi
 
-    parse_counters "$JSON_DATA"
+    if [ "$SOCKET_FRESH" = "1" ]; then
+        parse_counters "$JSON_DATA"
+        UPTIME_C_TS="$NOW_TS"
+    else
+        # Frozen snapshot: deltas from the last tick would be misleading.
+        DELTA=()
+    fi
     compute_effective
     calculate_all_rates
     update_term_width
     compute_health
     hw_collect_quick
 
-    # Track whether Suricata is counting at all (decoder stays at 0?)
-    if [ "$EFF_PKTS" -eq 0 ] && [ "$ZERO_CYCLES" -ge 0 ]; then
-        ZERO_CYCLES=$(( ZERO_CYCLES + 1 ))
-        [ "$ZERO_CYCLES" -eq 2 ] && { read_suricata_yaml; read_eve_age; }
-        [ "$ZERO_CYCLES" -gt 2 ] && [ $(( ZERO_CYCLES % 5 )) -eq 0 ] && read_eve_age
-    else
-        ZERO_CYCLES=0
+    # Track whether Suricata is counting at all (decoder stays at 0?).
+    # Only meaningful while the socket delivers fresh data.
+    if [ "$SOCKET_STATUS" = "OK" ]; then
+        if [ "$EFF_PKTS" -eq 0 ] && [ "$ZERO_CYCLES" -ge 0 ]; then
+            ZERO_CYCLES=$(( ZERO_CYCLES + 1 ))
+            [ "$ZERO_CYCLES" -eq 2 ] && { read_suricata_yaml; read_eve_age; }
+            [ "$ZERO_CYCLES" -gt 2 ] && [ $(( ZERO_CYCLES % 5 )) -eq 0 ] && read_eve_age
+        else
+            ZERO_CYCLES=0
+        fi
     fi
 
     if [ "$(safe_int "${PKT_RATE%.*}")" -gt "$HIGH_LOAD_PPS" ]; then
@@ -2244,8 +2641,11 @@ collect_cycle() {
     fi
     if [ "$FORCE_REFRESH" = "1" ] \
        || [ $(( NOW_TS - LAST_SLOW_TS )) -ge $(( SLOW_REFRESH_EVERY * REFRESH_INTERVAL * 1000 )) ]; then
-        get_rules_loaded
-        [ "${UPTIME_C:-0}" -gt 0 ] || sync_uptime
+        # Socket-based slow probes are skipped while the socket is busy.
+        if [ "$SOCKET_STATUS" = "OK" ]; then
+            get_rules_loaded
+            [ "${UPTIME_C:-0}" -gt 0 ] || sync_uptime
+        fi
         hw_collect_deep
         LAST_SLOW_TS="$NOW_TS"
     fi
@@ -2271,6 +2671,7 @@ draw() {
 
     status=" q quit | p pause | r refresh | j/k PgUp/PgDn g/G scroll | lines $((OFFSET+1))-$(( OFFSET+body > FRAME_LINES ? FRAME_LINES : OFFSET+body ))/${FRAME_LINES}"
     [ "$PAUSED" = "1" ] && status+=" | PAUSED"
+    [ "$DATA_MODE" != "socket" ] && status+=" | mode: ${DATA_MODE}"
 
     printf '\033[H'
     printf '%s\n' "$FRAME" | awk -v a=$((OFFSET+1)) -v b=$((OFFSET+body)) \
@@ -2327,8 +2728,16 @@ wait_for_input() {
 # ------------------------------------------------------------------------------
 # STARTUP
 # ------------------------------------------------------------------------------
+get_now_ms
 discover_socket
-[ "$SOCKET_STATUS" = "OK" ] && get_suricata_version
+if [ "$SOCKET_STATUS" = "OK" ]; then
+    SC_T="$SOCKET_TIMEOUT"
+    get_suricata_version
+elif [ "$SOCKET_STATUS" = "BUSY" ]; then
+    # Suricata is up but not answering yet: start in NIC-fallback mode.
+    mark_busy
+fi
+SC_T="$SOCKET_TIMEOUT"
 get_now_ms
 update_term_width
 hw_detect_platform
@@ -2393,7 +2802,7 @@ fi
 [ -t 1 ] || ONCE=1
 if [ "$ONCE" = "1" ]; then
     collect_cycle
-    if [ "$SOCKET_STATUS" = "OK" ]; then
+    if [ "$SOCKET_STATUS" = "OK" ] || [ "$SOCKET_STATUS" = "BUSY" ]; then
         sleep 2                # second sample gives the rates / deltas a baseline
         collect_cycle
     fi
