@@ -1,10 +1,53 @@
 # sl0ppy-SuriDash
 Sl0ppy-SuriDash is a bash based dashboard for suricata in IDS or IPS Mode
 
-# change log v1.2
-* added support for docker 
-* Added wider vendor health support (ibm, lenovo, dell, hp and more.)
-* optimized counters and other bits check the header for all info. 
+# change log v1.3
+```
+OUNTER CONTINUITY ENGINE (new)
+#     * Switching between the Suricata socket and the NIC counters (in either
+#       direction) can NEVER make the counters jump backwards, spike, or lose
+#       the traffic that was counted in the other mode. Everything the
+#       dashboard counted while running on NIC / estimator data is carried
+#       over ("cached") and merged back into the socket stats the moment the
+#       socket delivers a fresh snapshot again - the totals keep counting as
+#       if nothing happened.
+#     * Monotonic totals: "Total pkts (live)" / "Total bytes (live)" never
+#       decrease. On every fresh socket snapshot the engine takes
+#       max(socket value, cached live value) as the new anchor, so the NIC
+#       traffic seen during a busy socket window is never lost when the
+#       socket comes back (Suricata may have missed packets while busy - the
+#       cached NIC numbers are the more complete truth and they are kept).
+#     * Suricata restart / counter reset handling: when a lifetime counter
+#       (packets, bytes, flows, alerts, drops, ARP) restarts from 0, the
+#       previously observed lifetime is added as an offset, so adjusted
+#       lifetime totals keep counting across Suricata restarts. The raw
+#       Suricata value is still shown per counter; the rate/live-total engine
+#       uses the adjusted monotonic value. No fake "counter reset" rate
+#       spikes any more either.
+#     * NIC BUSY HANDLING (unit8200 workaround/bypass):
+#         - If /proc/net/dev is unreadable, or the NIC counters freeze while
+#           the socket is also busy, the dashboard switches to the
+#           estimator mode (labelled "unit8200 est" by default, override
+#           with EST_LABEL). Rates are held and decayed smoothly, and the
+#           live totals are extrapolated at the decayed rate so the numbers
+#           keep moving naturally instead of freezing.
+#         - Estimator mode is left automatically as soon as either the
+#           socket answers again or the NIC counters start moving again.
+#     * Rate continuity across every mode switch: socket rates are always
+#       computed over the REAL elapsed time between usable data points
+#       (snapshot -> snapshot, NIC -> socket, estimator -> socket), so the
+#       first socket snapshot after a busy/est window is the AVERAGE over the
+#       whole window: no spikes, no freeze, no visual glitch.
+#     * One decay engine for all held rates (pps, Mbit/s, drops/s, alerts/s,
+#       flows/s, ARP pps) that runs in every non-fresh mode so displayed
+#       values LOWER smoothly when traffic lowers, in any mode.
+#     * Health section shows the current data mode (socket / nic / est),
+#       the number of mode switches and the carried-over cache.
+#     * New env: NIC_STALE_S (6) - seconds without NIC counter movement
+#                (while traffic is expected) before estimator mode.
+#                EST_LABEL ("unit8200") - label for the estimator mode.
+#
+```
 
 # sl0ppy-SuriDash Pre Requirements
 * One must install suricata, jq.  
