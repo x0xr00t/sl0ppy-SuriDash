@@ -1,3 +1,7 @@
+![GitHub release](https://img.shields.io/github/v/release/x0xr00t/sl0ppy-SuriDash)
+![GitHub license](https://img.shields.io/github/license/x0xr00t/sl0ppy-SuriDash)
+![GitHub stars](https://img.shields.io/github/stars/x0xr00t/sl0ppy-SuriDash)
+![GitHub issues](https://img.shields.io/github/issues/x0xr00t/sl0ppy-SuriDash)
 # sl0ppy-SuriDash
 Sl0ppy-SuriDash is a bash based dashboard for suricata in IDS or IPS Mode
 
