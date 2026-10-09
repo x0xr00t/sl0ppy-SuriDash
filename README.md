@@ -158,7 +158,7 @@ unix-command:
   filename: suricata-command.socket
 
 ```
-# For ITV IPTV add this under HOMENET 
+# For ITV IPTV in IPS MODE add this under HOMENET 
 * kpn uptv itv example
 ```
     KPN_STB: ""
