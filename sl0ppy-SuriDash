@@ -1,14 +1,14 @@
 #!/bin/bash
 # ==============================================================================
-# sl0ppy Suricata Network Security & Threat Intelligence Dashboard  (v1.3)
+# sl0ppy Suricata Network Security & Threat Intelligence Dashboard  (v1.4)
 # Author : Patrick Hoogeven x0xr00t
 # Build  : 07102026
 # Name   : SuriDash
-# Version: v1.3
+# Version: v1.4
 # ==============================================================================
 # Read-only: nothing in the Suricata configuration is ever modified.
 #
-# v1.3 changes (on top of v1.2):
+# v1.4 changes (on top of v1.3):
 #   COUNTER CONTINUITY ENGINE (new)
 #     * Switching between the Suricata socket and the NIC counters (in either
 #       direction) can NEVER make the counters jump backwards, spike, or lose
@@ -49,17 +49,29 @@
 #       values LOWER smoothly when traffic lowers, in any mode.
 #     * Health section shows the current data mode (socket / nic / est),
 #       the number of mode switches and the carried-over cache.
+#   CONNECTION ERROR GRACE (new)
+#     * A FAILED socket (Suricata process gone / socket never found) is first
+#       treated like a busy socket: the dashboard keeps running from the NIC /
+#       estimator with the full continuity engine (rates, live totals and the
+#       cache all keep counting, decay as needed) and shows a red banner with
+#       a countdown instead of the error page.
+#     * Only after FAIL_GRACE_S (default 3600s = 1 hour) of continuous
+#       failure is the full connection error page shown.
+#     * As soon as Suricata answers again (it is re-probed every cycle) the
+#       cached NIC/estimator traffic is merged back into the socket stats
+#       and a green "answered again after Xs offline" banner confirms it.
 #     * New env: NIC_STALE_S (6) - seconds without NIC counter movement
 #                (while traffic is expected) before estimator mode.
 #                EST_LABEL ("unit8200") - label for the estimator mode.
+#                FAIL_GRACE_S (3600) - banner window before the error page.
 #
-# v1.2 changes (kept):
+# v1.3 changes (kept):
 #   * Every suricatasc call wrapped in `timeout`; BUSY socket state with
 #     frozen snapshot, NIC fallback, periodic re-probe (SOCKET_RETRY_S),
 #     automatic recovery, real socket discovery, baseline guard.
 #   * Virtual machines detected and annotated; SMART/RAID/SEL deep probes on
 #     the slow cadence; cheap /sys probes every cycle.
-# v1.1 changes (kept):
+# v1.2 changes (kept):
 #   * Hardware / vendor health section (IBM, Lenovo, Dell, HP/HPE, Fujitsu,
 #     Supermicro, Huawei, ASUS, Acer, MSI, Gigabyte, Apple, Oracle/Sun,
 #     Toshiba, Samsung + virtual platforms), CPU temp chain
@@ -87,7 +99,7 @@ fi
 if [ -n "${LC_ALL:-}" ]; then export LANG="$LC_ALL"; unset LC_ALL; fi
 export LC_NUMERIC=C
 
-Suridash_Version="v1.3"
+Suridash_Version="v1.4"
 
 # ------------------------------------------------------------------------------
 # COLORS & STYLING (real escape characters: safe for printf '%s')
@@ -131,6 +143,9 @@ SOCKET_RETRY_S="${SOCKET_RETRY_S:-4}"            # s: pause between probes while
 # ---- continuity / estimator ---------------------------------------------------
 NIC_STALE_S="${NIC_STALE_S:-6}"                  # s: NIC frozen this long -> estimator
 EST_LABEL="${EST_LABEL:-unit8200}"               # label of the NIC-busy estimator mode
+FAIL_GRACE_S="${FAIL_GRACE_S:-3600}"             # s: FAILED socket shows a banner (dashboard
+                                                 #    keeps running from NIC/estimator) up to
+                                                 #    this long; after that the error page
 
 # ---- hardware / vendor health ------------------------------------------------
 HW_TEMP_WARN="${HW_TEMP_WARN:-70}"     # CPU temp warn threshold (C)
@@ -179,6 +194,7 @@ Environment: REFRESH_INTERVAL FAST_LOG EVE_LOG SURICATA_SOCKET NIC_IFACES
   FP_LABEL FP_REGEX FP_HIDE HEALTH_HOLD_S RATE_DECAY DEBUG_RATES
   HW_TEMP_WARN HW_TEMP_CRIT SMART_ENABLED IPMI_ENABLED
   SOCKET_TIMEOUT SOCKET_BUSY_TIMEOUT SOCKET_RETRY_S NIC_STALE_S EST_LABEL
+  FAIL_GRACE_S (FAILED socket: banner up to FAIL_GRACE_S, then the error page)
 EOF
 }
 
@@ -208,7 +224,7 @@ fi
 for _v in EVE_SAMPLE_LINES EVE_SAMPLE_LINES_HIGH HIGH_LOAD_PPS EVE_REFRESH_EVERY \
           SLOW_REFRESH_EVERY ALERT_SCAN_LINES ALERT_MAX_SCAN ALERT_BOX_LINES \
           REFRESH_INTERVAL HEALTH_HOLD_S HW_TEMP_WARN HW_TEMP_CRIT \
-          SOCKET_TIMEOUT SOCKET_BUSY_TIMEOUT SOCKET_RETRY_S NIC_STALE_S; do
+          SOCKET_TIMEOUT SOCKET_BUSY_TIMEOUT SOCKET_RETRY_S NIC_STALE_S FAIL_GRACE_S; do
     if ! [[ "${!_v}" =~ ^[1-9][0-9]*$ ]]; then
         printf '%s\n' "${RED}[-] ${_v} must be a positive integer (got: '${!_v}').${NC}"
         exit 1
@@ -389,6 +405,9 @@ SOCKET_BUSY_LAST_S=0         # duration (s) of the last finished busy episode
 SOCKET_NEXT_PROBE=0          # ms timestamp of the next allowed probe while BUSY
 SOCKET_LAST_OK_TS=0          # ms timestamp of the last good counters reply
 SOCKET_RECOVERED_UNTIL=0     # show the "recovered" banner until this ms timestamp
+SOCKET_FAIL_SINCE=0          # ms timestamp when the current FAILED episode began
+SOCKET_FAIL_LAST_S=0         # duration (s) of the last finished FAILED episode
+SOCKET_FAIL_TOTAL=0          # FAILED episodes since the dashboard started
 FETCH_REPLY=""
 UPTIME_C_TS=0                # ms timestamp when UPTIME_C was last refreshed
 SNAP_VALID=0                 # 1 once a real socket snapshot anchored the rates
@@ -1035,6 +1054,32 @@ mark_busy() {
     SOCKET_NEXT_PROBE=$(( NOW_TS + SOCKET_RETRY_S * 1000 ))
 }
 
+# Enter / stay in the FAILED state (Suricata process gone / socket never
+# found). While the episode is younger than FAIL_GRACE_S the dashboard keeps
+# running from the NIC / estimator (same continuity engine, counters keep
+# counting); after the grace window the connection error page is shown.
+mark_failed() {
+    if [ "$SOCKET_FAIL_SINCE" -eq 0 ]; then
+        SOCKET_FAIL_SINCE="$NOW_TS"
+        SOCKET_FAIL_TOTAL=$(( SOCKET_FAIL_TOTAL + 1 ))
+    fi
+    SOCKET_STATUS="FAILED"
+    SOCKET_BUSY_SINCE=0
+}
+
+# Seconds the current FAILED episode has been running (0 when not FAILED).
+fail_age_s() {
+    [ "$SOCKET_STATUS" = "FAILED" ] && [ "$SOCKET_FAIL_SINCE" -gt 0 ] \
+        && printf '%s' $(( (NOW_TS - SOCKET_FAIL_SINCE) / 1000 )) || printf '%s' 0
+}
+
+# 1 = within the grace window: keep the dashboard alive with a banner.
+fail_in_grace() {
+    [ "$SOCKET_STATUS" = "FAILED" ] || return 1
+    [ "$SOCKET_FAIL_SINCE" -gt 0 ] || return 0
+    [ $(( NOW_TS - SOCKET_FAIL_SINCE )) -lt $(( FAIL_GRACE_S * 1000 )) ]
+}
+
 # Fetch a counters reply. Returns 0 only for a usable reply; a timeout, empty
 # output or a {"return":"NOK"} answer all count as "socket busy".
 socket_fetch_counters() {
@@ -1065,7 +1110,7 @@ socket_update() {
             discover_socket
             get_now_ms
             case "$SOCKET_STATUS" in
-                FAILED) SOCKET_BUSY_SINCE=0; return 0 ;;
+                FAILED) mark_failed; return 0 ;;
                 BUSY)   mark_busy; return 0 ;;
             esac
             ;;
@@ -1086,6 +1131,12 @@ socket_update() {
             recovered=1
         fi
         SOCKET_STATUS="OK"; SOCKET_BUSY_SINCE=0; SOCKET_BUSY_FAILS=0
+        if [ "$SOCKET_FAIL_SINCE" -gt 0 ]; then
+            SOCKET_FAIL_LAST_S=$(( (NOW_TS - SOCKET_FAIL_SINCE) / 1000 ))
+            SOCKET_FAIL_SINCE=0
+            SOCKET_RECOVERED_UNTIL=$(( NOW_TS + 15000 ))
+            recovered=1
+        fi
         SC_T="$SOCKET_TIMEOUT"
         [ "$SURICATA_VERSION" = "UNKNOWN" ] && get_suricata_version
         [ "$recovered" -eq 1 ] && get_rules_loaded
@@ -1099,7 +1150,7 @@ socket_update() {
             fi
             mark_busy
         else
-            SOCKET_STATUS="FAILED"; SOCKET_BUSY_SINCE=0
+            mark_failed
         fi
     fi
     SC_T="$SOCKET_TIMEOUT"
@@ -1318,10 +1369,18 @@ delta_pos() {
 }
 
 compute_health() {
-    local score=100 reasons="" name pen pct dd dp
+    local score=100 reasons="" name pen pct dd dp fage
 
     case "$SOCKET_STATUS" in
         OK|BUSY) ;;
+        FAILED)
+            if fail_in_grace; then
+                :   # within the grace window: NIC/estimator keeps the
+                    # dashboard running, listed as a reason below
+            else
+                HEALTH_PCT=0; HEALTH_REASONS="socket-offline; "; return
+            fi
+            ;;
         *) HEALTH_PCT=0; HEALTH_REASONS="socket-offline; "; return ;;
     esac
 
@@ -1356,6 +1415,10 @@ compute_health() {
     done
     if [ "$SOCKET_STATUS" = "BUSY" ]; then
         reasons+="socket-busy (${DATA_MODE} fallback); "
+    fi
+    if [ "$SOCKET_STATUS" = "FAILED" ]; then
+        fage="$(fail_age_s)"
+        reasons+="socket-failed ${fage}s (${DATA_MODE} fallback, error page in $(( FAIL_GRACE_S - fage ))s); "
     fi
     if [ "$RESTARTS" -gt 0 ]; then
         reasons+="suricata-restarts=${RESTARTS} (offsets keep totals); "
@@ -2319,7 +2382,16 @@ show_eve_stats() {
 # Banner shown under the header while the socket is busy (and for a few
 # seconds after it came back). Explains the current fallback data mode.
 show_socket_banner() {
-    local since age next
+    local since age next fage left
+    if [ "$SOCKET_STATUS" = "FAILED" ]; then
+        fage="$(fail_age_s)"
+        left=$(( FAIL_GRACE_S - fage ))
+        printf '%s\n' "${RED}${BOLD}[!] SURICATA NOT RESPONDING for ${fage}s - ${DATA_MODE} fallback active, counters keep counting${NC}"
+        printf '%s\n' "${RED}    Suricata process/socket is gone. Rates and live totals come from the NIC / ${EST_LABEL} estimator${NC}"
+        printf '%s\n' "${RED}    and are merged back into the socket stats when Suricata answers again.${NC}"
+        printf '%s\n' "${YELLOW}    Connection error page in ${left}s (FAIL_GRACE_S=${FAIL_GRACE_S}) - the socket is re-probed every cycle.${NC}"
+        return
+    fi
     if [ "$SOCKET_STATUS" = "BUSY" ]; then
         since=0; age=0
         [ "$SOCKET_BUSY_SINCE" -gt 0 ] && since=$(( (NOW_TS - SOCKET_BUSY_SINCE) / 1000 ))
@@ -2337,7 +2409,11 @@ show_socket_banner() {
             printf '%s\n' "${YELLOW}    No Suricata snapshot received yet | next socket probe in ${next}s | failed probes: ${SOCKET_BUSY_FAILS}${NC}"
         fi
     elif [ "$SOCKET_RECOVERED_UNTIL" -gt "$NOW_TS" ]; then
-        printf '%s\n' "${GREEN}${BOLD}[+] Suricata socket answered again after ${SOCKET_BUSY_LAST_S}s - cached ${DATA_MODE} traffic merged back, counters kept counting${NC}"
+        if [ "$SOCKET_FAIL_LAST_S" -gt 0 ]; then
+            printf '%s\n' "${GREEN}${BOLD}[+] Suricata answered again after ${SOCKET_FAIL_LAST_S}s offline - cached ${DATA_MODE} traffic merged back, counters kept counting${NC}"
+        else
+            printf '%s\n' "${GREEN}${BOLD}[+] Suricata socket answered again after ${SOCKET_BUSY_LAST_S}s - cached ${DATA_MODE} traffic merged back, counters kept counting${NC}"
+        fi
     elif [ "$DATA_MODE" = "est" ]; then
         printf '%s\n' "${MAGENTA}${BOLD}[~] ${EST_LABEL^^} ESTIMATOR ACTIVE (NIC counters busy) - rates decay smoothly, totals keep counting${NC}"
     fi
@@ -2349,6 +2425,12 @@ show_health() {
 
     if [ "$SOCKET_STATUS" = "BUSY" ]; then
         status="SOCKET BUSY (${DATA_MODE})"; status_color="$YELLOW"; sock_col="$YELLOW"
+    elif [ "$SOCKET_STATUS" = "FAILED" ]; then
+        if fail_in_grace; then
+            status="CONN LOST (${DATA_MODE})"; status_color="$YELLOW"; sock_col="$RED"
+        else
+            status="SOCKET OFFLINE"; status_color="$RED"; sock_col="$RED"
+        fi
     elif [ "$SOCKET_STATUS" != "OK" ]; then
         status="SOCKET OFFLINE"; status_color="$RED"; sock_col="$RED"
     elif hp_active capture-drop; then
@@ -2390,6 +2472,9 @@ show_health() {
     row "Cache merged:" "+$(fmt_num "$CACHE_PKTS") pkts" "$GREEN" \
         "Cache merges:" "$CACHE_MERGES" "$CYAN" \
         "Busy episodes:" "$SOCKET_BUSY_TOTAL" "$YELLOW"
+    row "Conn lost for:" "$(fail_age_s)s" "$YELLOW" \
+        "Fail episodes:" "$SOCKET_FAIL_TOTAL" "$YELLOW" \
+        "Last fail:" "${SOCKET_FAIL_LAST_S}s" "$YELLOW"
     row "Load:" "$LOAD_LABEL" "$CYAN" \
         "Refresh:" "${REFRESH_INTERVAL}s" "$CYAN" \
         "Health hold:" "${HEALTH_HOLD_S}s" "$CYAN"
@@ -2452,6 +2537,12 @@ render_frame() {
     case "$SOCKET_STATUS" in
         OK)   status_txt="ACTIVE";      st_col="$GREEN" ;;
         BUSY) status_txt="BUSY (NIC)";  st_col="$YELLOW" ;;
+        FAILED)
+            if fail_in_grace; then
+                status_txt="CONN LOST (NIC)"; st_col="$YELLOW"
+            else
+                status_txt="OFFLINE";        st_col="$RED"
+            fi ;;
         *)    status_txt="OFFLINE";     st_col="$RED" ;;
     esac
     if [ "$RULES_LOADED" -gt 0 ]; then rules_txt="$RULES_LOADED"; else rules_txt="n/a"; fi
@@ -2492,7 +2583,7 @@ render_frame() {
         "Suridash:" "$Suridash_Version" "$CYAN" \
         "Refresh:" "${REFRESH_INTERVAL}s" "$CYAN"
     show_socket_banner
-    if [ "$SOCKET_STATUS" = "BUSY" ]; then
+    if [ "$SOCKET_STATUS" = "BUSY" ] || { [ "$SOCKET_STATUS" = "FAILED" ] && fail_in_grace; }; then
         snap_age="n/a"
         [ "$SOCKET_LAST_OK_TS" -gt 0 ] && snap_age="$(( (NOW_TS - SOCKET_LAST_OK_TS) / 1000 ))s"
         printf '%s\n' "${DIM}    stats: cached (last snapshot ${snap_age} ago) - totals keep counting from ${DATA_MODE} data${NC}"
@@ -2593,11 +2684,15 @@ collect_cycle() {
     socket_update
     get_now_ms
 
-    if [ "$SOCKET_STATUS" != "OK" ] && [ "$SOCKET_STATUS" != "BUSY" ]; then
+    if [ "$SOCKET_STATUS" = "FAILED" ] && ! fail_in_grace; then
+        # Failed for longer than FAIL_GRACE_S: show the connection error page.
         update_term_width
         set_frame "$(show_connection_error)"
         return 1
     fi
+    # FAILED but within the grace window: fall through - the dashboard keeps
+    # running from the NIC / estimator (same continuity engine, counters keep
+    # counting) and a banner explains the state.
 
     if [ "$SOCKET_FRESH" = "1" ]; then
         parse_counters "$JSON_DATA"
