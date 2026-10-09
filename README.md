@@ -159,9 +159,10 @@ unix-command:
 
 ```
 # For ITV IPTV add this under HOMENET 
+* kpn uptv itv example
 ```
     KPN_STB: ""
-
+    
 ```
 
 # 4. Install rules (ETOpen — what your alerts use)
