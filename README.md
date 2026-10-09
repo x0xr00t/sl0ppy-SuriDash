@@ -5,9 +5,10 @@
 # sl0ppy-SuriDash
 Sl0ppy-SuriDash is a bash based dashboard for suricata in IDS or IPS Mode
 
-# change log v1.3
+# change log v1.4
 ```
-OUNTER CONTINUITY ENGINE (new)
+# v1.4 changes (on top of v1.3):
+#   COUNTER CONTINUITY ENGINE (new)
 #     * Switching between the Suricata socket and the NIC counters (in either
 #       direction) can NEVER make the counters jump backwards, spike, or lose
 #       the traffic that was counted in the other mode. Everything the
@@ -47,10 +48,41 @@ OUNTER CONTINUITY ENGINE (new)
 #       values LOWER smoothly when traffic lowers, in any mode.
 #     * Health section shows the current data mode (socket / nic / est),
 #       the number of mode switches and the carried-over cache.
+#   CONNECTION ERROR GRACE (new)
+#     * A FAILED socket (Suricata process gone / socket never found) is first
+#       treated like a busy socket: the dashboard keeps running from the NIC /
+#       estimator with the full continuity engine (rates, live totals and the
+#       cache all keep counting, decay as needed) and shows a red banner with
+#       a countdown instead of the error page.
+#     * Only after FAIL_GRACE_S (default 3600s = 1 hour) of continuous
+#       failure is the full connection error page shown.
+#     * As soon as Suricata answers again (it is re-probed every cycle) the
+#       cached NIC/estimator traffic is merged back into the socket stats
+#       and a green "answered again after Xs offline" banner confirms it.
 #     * New env: NIC_STALE_S (6) - seconds without NIC counter movement
 #                (while traffic is expected) before estimator mode.
 #                EST_LABEL ("unit8200") - label for the estimator mode.
+#                FAIL_GRACE_S (3600) - banner window before the error page.
 #
+# v1.3 changes (kept):
+#   * Every suricatasc call wrapped in `timeout`; BUSY socket state with
+#     frozen snapshot, NIC fallback, periodic re-probe (SOCKET_RETRY_S),
+#     automatic recovery, real socket discovery, baseline guard.
+#   * Virtual machines detected and annotated; SMART/RAID/SEL deep probes on
+#     the slow cadence; cheap /sys probes every cycle.
+# v1.2 changes (kept):
+#   * Hardware / vendor health section (IBM, Lenovo, Dell, HP/HPE, Fujitsu,
+#     Supermicro, Huawei, ASUS, Acer, MSI, Gigabyte, Apple, Oracle/Sun,
+#     Toshiba, Samsung + virtual platforms), CPU temp chain
+#     (thermal_zone -> lm-sensors -> ThinkPad ACPI -> IPMI SDR), battery,
+#     CPU freq/throttle, SMART (-n standby), RAID toolchains, EDAC, IPMI SEL.
+#   * Live totals interpolated from /proc/net/dev between stats ticks,
+#     per-counter "+N" deltas in every section, rate decay, ARP rate.
+# v1.1 highlights (kept):
+#   * counter map audited against the Suricata 7/8 stats tree, wildcard
+#     paths, object-sum lookups, "n/a" for keys your build does not expose.
+#   * health penalties held HEALTH_HOLD_S, flicker-free redraw, scrolling,
+#     pause, --once, --check, --debug-counters, --debug-parse.
 ```
 
 # sl0ppy-SuriDash Pre Requirements
