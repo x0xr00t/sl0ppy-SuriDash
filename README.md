@@ -126,7 +126,7 @@ ip -4 addr show ens18       # your LAN range (e.g. 192.168.2.0/24)
 ```
 vars:
   address-groups:
-    HOME_NET: "[192.168.2.0/24]"      # your LAN
+    HOME_NET: "[192.168.x.x/24]"      # your LAN
     EXTERNAL_NET: "!$HOME_NET"
 
 default-rule-path: /var/lib/suricata/rules
@@ -158,6 +158,12 @@ unix-command:
   filename: suricata-command.socket
 
 ```
+# For ITV IPTV add this under HOMENET 
+```
+    KPN_STB: ""
+
+```
+
 # 4. Install rules (ETOpen — what your alerts use)
 ```
 sudo suricata-update                    # fetches etopen.rules, writes to /var/lib/suricata/rules
