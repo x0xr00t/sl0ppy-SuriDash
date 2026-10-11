@@ -1,15 +1,49 @@
 #!/bin/bash
 # ==============================================================================
-# sl0ppy Suricata Network Security & Threat Intelligence Dashboard  (v1.4)
+# sl0ppy Suricata Network Security & Threat Intelligence Dashboard  (v1.5)
 # Author : Patrick Hoogeven x0xr00t
 # Build  : 07102026
 # Name   : SuriDash
-# Version: v1.4
+# Version: v1.5
 # ==============================================================================
 # Read-only: nothing in the Suricata configuration is ever modified.
 #
-# v1.4 changes (on top of v1.3):
-#   COUNTER CONTINUITY ENGINE (new)
+# v1.5 changes (on top of v1.4):
+#   ALERT LOGGING (new)
+#     * --log-hmr : append HIGH + MEDIUM risk alerts (severity 1-2) to
+#                   LOG_FILE (default /var/log/suridash-alerts.log).
+#     * --log-all : append LOW + MEDIUM + HIGH risk alerts (severity 1-3)
+#                   to LOG_FILE.
+#     * Alert severity mapping (Suricata convention): 1 = high, 2 = medium,
+#       3 = low. Severity 4+ / informational is never logged.
+#     * Each alert is logged exactly once (dedup on timestamp + sid +
+#       signature + endpoints) even though the scan window is re-read every
+#       refresh cycle. Works in interactive, --once and socket-busy modes.
+#     * Kernel capture counter fix: KERNEL_PKTS / KERNEL_DROPS /
+#       KERNEL_IFDROPS now also resolve through wildcard paths so they show
+#       correctly on every Suricata 7/8 build and capture mode. Suricata
+#       exposes these either flat (capture.kernel_packets), per-thread
+#       (summed automatically via the threads unwrap) or nested per
+#       ring/worker/iface (capture.nic-rings0.kernel_packets,
+#       capture.worker-rings1.kernel_drops, capture.<iface>.packets, ...).
+#       The wildcard alternatives (capture.*.kernel_packets etc.) sum the
+#       counter under EVERY capture instance, so multi-ring AF_PACKET,
+#       NFQ, netmap, PF and per-worker setups all report full totals
+#       instead of a stuck "n/a" or partial 0.
+#     * KERNEL COUNTER FALLBACK (new): many Suricata builds/modes expose NO
+#       capture.* stats at all (only capture_bypassed / local_capture_*), so
+#       KERNEL_PKTS / KERNEL_DROPS / KERNEL_IFDROPS used to sit at "n/a"
+#       forever. When the socket does not deliver capture counters, the
+#       dashboard now reads the kernel's own view from /proc/net/dev
+#       (rx+tx packets, rx+tx dropped on the sniff interfaces) and feeds it
+#       through the SAME delta + continuity engine as the socket counters:
+#       real kernel packets/drops, live "+N" deltas, a working drop ratio and
+#       capture-drop health penalties, monotonic across NIC counter resets.
+#       The counter source is visible in --check ("proc:/proc/net/dev").
+#     * New env: LOG_FILE (/var/log/suridash-alerts.log) - target of both flags.
+#
+# v1.4 changes (kept):
+#   COUNTER CONTINUITY ENGINE
 #     * Switching between the Suricata socket and the NIC counters (in either
 #       direction) can NEVER make the counters jump backwards, spike, or lose
 #       the traffic that was counted in the other mode. Everything the
@@ -49,7 +83,7 @@
 #       values LOWER smoothly when traffic lowers, in any mode.
 #     * Health section shows the current data mode (socket / nic / est),
 #       the number of mode switches and the carried-over cache.
-#   CONNECTION ERROR GRACE (new)
+#   CONNECTION ERROR GRACE
 #     * A FAILED socket (Suricata process gone / socket never found) is first
 #       treated like a busy socket: the dashboard keeps running from the NIC /
 #       estimator with the full continuity engine (rates, live totals and the
@@ -60,10 +94,6 @@
 #     * As soon as Suricata answers again (it is re-probed every cycle) the
 #       cached NIC/estimator traffic is merged back into the socket stats
 #       and a green "answered again after Xs offline" banner confirms it.
-#     * New env: NIC_STALE_S (6) - seconds without NIC counter movement
-#                (while traffic is expected) before estimator mode.
-#                EST_LABEL ("unit8200") - label for the estimator mode.
-#                FAIL_GRACE_S (3600) - banner window before the error page.
 #
 # v1.3 changes (kept):
 #   * Every suricatasc call wrapped in `timeout`; BUSY socket state with
@@ -85,7 +115,8 @@
 #   * health penalties held HEALTH_HOLD_S, flicker-free redraw, scrolling,
 #     pause, --once, --check, --debug-counters, --debug-parse.
 #
-# Usage:  sudo ./suridash.sh [-i SECONDS] [--once] [--check] [--debug-counters]
+# Usage:  sudo ./suridash.sh [-i SECONDS] [--log-hmr|--log-all] [--once]
+#         sudo ./suridash.sh [--check] [--debug-counters] [--debug-parse]
 #         sudo ./suridash.sh --help
 # ==============================================================================
 
@@ -99,7 +130,7 @@ fi
 if [ -n "${LC_ALL:-}" ]; then export LANG="$LC_ALL"; unset LC_ALL; fi
 export LC_NUMERIC=C
 
-Suridash_Version="v1.4"
+Suridash_Version="v1.5"
 
 # ------------------------------------------------------------------------------
 # COLORS & STYLING (real escape characters: safe for printf '%s')
@@ -130,6 +161,10 @@ ALERT_BOX_LINES="${ALERT_BOX_LINES:-6}"
 FP_LABEL="${FP_LABEL:-unit8200}"
 FP_REGEX="${FP_REGEX:-unit8200}"
 FP_HIDE="${FP_HIDE:-0}"
+
+# ---- alert logging (--log-hmr / --log-all) ------------------------------------
+LOG_MODE="${LOG_MODE:-none}"                      # none | hmr | all (set by CLI flags)
+LOG_FILE="${LOG_FILE:-/var/log/suridash-alerts.log}"
 
 HEALTH_HOLD_S="${HEALTH_HOLD_S:-30}"
 NIC_IFACES="${NIC_IFACES:-}"
@@ -170,6 +205,10 @@ sl0ppy Suricata Dashboard ${Suridash_Version}
 Usage: sudo $0 [options]
 
   -i, --interval SEC    refresh interval in seconds (default ${REFRESH_INTERVAL})
+      --log-hmr         append HIGH + MEDIUM risk alerts (severity 1-2) to
+                        LOG_FILE (default ${LOG_FILE})
+      --log-all         append LOW + MEDIUM + HIGH risk alerts (severity 1-3)
+                        to LOG_FILE
       --once            print one frame and exit (no interactive UI)
       --check           list every counter, its value and the stats key it
                         resolved from (verifies the mapping on your build)
@@ -191,7 +230,7 @@ carry across Suricata restarts.
 Environment: REFRESH_INTERVAL FAST_LOG EVE_LOG SURICATA_SOCKET NIC_IFACES
   EVE_SAMPLE_LINES EVE_SAMPLE_LINES_HIGH HIGH_LOAD_PPS EVE_REFRESH_EVERY
   SLOW_REFRESH_EVERY ALERT_SCAN_LINES ALERT_MAX_SCAN ALERT_BOX_LINES
-  FP_LABEL FP_REGEX FP_HIDE HEALTH_HOLD_S RATE_DECAY DEBUG_RATES
+  FP_LABEL FP_REGEX FP_HIDE HEALTH_HOLD_S RATE_DECAY DEBUG_RATES LOG_FILE
   HW_TEMP_WARN HW_TEMP_CRIT SMART_ENABLED IPMI_ENABLED
   SOCKET_TIMEOUT SOCKET_BUSY_TIMEOUT SOCKET_RETRY_S NIC_STALE_S EST_LABEL
   FAIL_GRACE_S (FAILED socket: banner up to FAIL_GRACE_S, then the error page)
@@ -204,6 +243,8 @@ while [ $# -gt 0 ]; do
         -V|--version)     echo "Suridash ${Suridash_Version}"; exit 0 ;;
         -i|--interval)    [ $# -ge 2 ] || { echo "[-] $1 needs a value" >&2; exit 1; }
                           REFRESH_INTERVAL="$2"; shift ;;
+        --log-hmr)        LOG_MODE="hmr" ;;
+        --log-all)        LOG_MODE="all" ;;
         --once)           ONCE=1 ;;
         --check)          CHECK_MODE=1 ;;
         --debug-counters) DEBUG_COUNTERS=1 ;;
@@ -219,6 +260,22 @@ done
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
     printf '%s\n' "${RED}[-] This dashboard requires root privileges (sudo).${NC}"
     exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# ALERT LOG FILE CHECK (--log-hmr / --log-all)
+# ------------------------------------------------------------------------------
+if [ "$LOG_MODE" != "none" ]; then
+    case "$LOG_MODE" in
+        hmr|all) ;;
+        *) printf '%s\n' "${RED}[-] Invalid LOG_MODE: ${LOG_MODE} (none|hmr|all).${NC}" >&2; exit 1 ;;
+    esac
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    if [ ! -w "$(dirname "$LOG_FILE")" ]; then
+        printf '%s\n' "${RED}[-] Cannot write alert log directory: $(dirname "$LOG_FILE")${NC}" >&2
+        exit 1
+    fi
+    printf '%s\n' "${GREEN}[+] Alert logging: ${LOG_MODE} (sev $([ "$LOG_MODE" = "all" ] && echo '1-3' || echo '1-2')) -> ${LOG_FILE}${NC}" >&2
 fi
 
 for _v in EVE_SAMPLE_LINES EVE_SAMPLE_LINES_HIGH HIGH_LOAD_PPS EVE_REFRESH_EVERY \
@@ -272,9 +329,22 @@ COUNTER_MAP=(
     "AVG_PKT:decoder.avg_pkt_size"
     "MAX_PKT:decoder.max_pkt_size"
     # ---- capture -------------------------------------------------------------
-    "KERNEL_PKTS:capture.kernel_packets|capture.kernel_pkts"
-    "KERNEL_DROPS:capture.kernel_drops|capture.kernel_drop"
-    "KERNEL_IFDROPS:capture.kernel_ifdrops"
+    # Kernel capture counters. Suricata 7/8 exposes them flat
+    # (capture.kernel_packets), per-thread (threads unwrap sums those
+    # automatically) or nested per ring / worker / iface (AF_PACKET with
+    # multiple rings, netmap, PF, NFQ: capture.nic-rings0.kernel_packets,
+    # capture.worker-rings1.kernel_drops, capture.<iface>.packets, ...).
+    # The wildcard alternatives (a.*.b) sum the leaf counter under EVERY
+    # child of "capture", so every layout resolves to the FULL total:
+    #   KERNEL_PKTS   = all kernel packets seen by all capture instances
+    #   KERNEL_DROPS  = all kernel drops of all capture instances
+    #   KERNEL_IFDROPS = all interface drops of all capture instances
+    # Lifetimes stay monotonic: all three are in RESET_KEYS, so a ring/thread
+    # layout change (or a Suricata restart) can never make them jump
+    # backwards - the observed lifetime is kept as a continuity offset.
+    "KERNEL_PKTS:capture.kernel_packets|capture.kernel_pkts|capture.*.kernel_packets|capture.*.kernel_pkts|capture.*.packets"
+    "KERNEL_DROPS:capture.kernel_drops|capture.kernel_drop|capture.*.kernel_drops|capture.*.kernel_drop|capture.*.drops"
+    "KERNEL_IFDROPS:capture.kernel_ifdrops|capture.*.kernel_ifdrops|capture.*.ifdrops"
     # ---- flow ----------------------------------------------------------------
     "ACTIVE_FLOWS:flow.active|flow_mgr.flows_active"
     "TOTAL_FLOWS:flow.total|flow.tcp+flow.udp+flow.icmpv4+flow.icmpv6"
@@ -450,6 +520,10 @@ LAST_EVE_TS=0; LAST_SLOW_TS=0
 
 # ALERT SECTION STATE
 ALERT_HI=""; ALERT_INFO=""; CNT_HI=0; CNT_INFO=0; CNT_FP=0
+
+# ALERT LOGGING STATE (--log-hmr / --log-all)
+declare -A LOG_SEEN=()      # dedup keys of already-logged alerts
+LOG_WRITTEN=0               # alerts written to LOG_FILE since start
 
 # RATES
 PKT_RATE="0.00"; MBIT_RATE="0.00"; DROP_RATE="0.00"
@@ -653,6 +727,25 @@ NR > 2 {
     p += f[2] + f[10]; b += f[1] + f[9]
 }
 END { printf "%.0f %.0f\n", p, b }
+EOF
+
+# Kernel packets + drops straight from /proc/net/dev (the kernel's own view).
+# rx drop = f[4], tx drop = f[12] (columns: bytes packets errs drop ... x2).
+# Used as the fallback when this Suricata build exposes no capture.* stats.
+read -r -d '' AWK_IFACE_KERNEL <<'EOF'
+BEGIN { n = split(inc, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+NR > 2 {
+    line = $0; sub(/^[ \t]+/, "", line)
+    name = line; sub(/:.*/, "", name)
+    sub(/^[^:]*:/, "", line)
+    split(line, f, " ")
+    if (name == "lo") next
+    if (n > 0 && !(name in want)) next
+    if (n == 0 && name ~ /^(docker|veth|virbr|br-)/) next
+    p += f[2] + f[10]
+    d += f[4] + f[12]
+}
+END { printf "%.0f %.0f\n", p, d }
 EOF
 
 read -r -d '' AWK_RATES <<'EOF'
@@ -1196,6 +1289,12 @@ parse_counters() {
         fi
 
         prev="${PREV_VAL[$k]:-}"
+        if [ "${CTR_ALT[$k]:-}" = "proc:/proc/net/dev" ] && [ "$alt" != "proc:/proc/net/dev" ]; then
+            # Source switched from the /proc/net/dev kernel fallback back to
+            # real socket counters (different scale): re-anchor cleanly, no
+            # offset or delta carry-over between the two sources.
+            prev=""; PREV_VAL[$k]=""; CTR_OFF[$k]=0; DELTA[$k]=""
+        fi
         if [ -n "$prev" ] && [ "$v" -lt "$prev" ]; then
             # ---- continuity: Suricata restarted / counter reset --------------
             # Keep counting: add the whole observed lifetime as an offset so the
@@ -1410,7 +1509,7 @@ compute_health() {
     for name in "${HP_ORDER[@]}"; do
         if hp_active "$name"; then
             score=$(( score - ${HP_PEN[$name]:-0} ))
-            reasons+="${HP_TXT[$name]:-$name}; "
+            reason+="${HP_TXT[$name]:-$name}; "
         fi
     done
     if [ "$SOCKET_STATUS" = "BUSY" ]; then
@@ -1475,6 +1574,61 @@ peak_roll() {   # $1 = current, $2 = peak, $3 = floor -> NEW_PEAK
 # often Suricata refreshes its stats snapshot (or whether its socket answers).
 read_iface_stats() {
     awk -v inc="$NIC_IFACES" "$AWK_IFACE" /proc/net/dev 2>/dev/null || echo "0 0"
+}
+
+# ------------------------------------------------------------------------------
+# KERNEL COUNTER FALLBACK  (Suricata build exposes no capture.* stats)
+#   When dump-counters never delivers kernel capture counters (KERNEL_PKTS
+#   stays n/a - e.g. builds that only report capture_bypassed / local_capture
+#   stats), the dashboard takes the kernel's own numbers from /proc/net/dev:
+#     KERNEL_PKTS     = rx+tx packets on the sniff interfaces
+#     KERNEL_DROPS    = rx+tx dropped on the sniff interfaces
+#     KERNEL_IFDROPS  = the same interface drops (no separate kernel counter)
+#   The values go through the SAME delta + continuity engine as socket
+#   counters (reset offsets, "+N" deltas, drop ratio, health penalties), so
+#   the kernel counters are fully working in every mode - including while
+#   the socket is busy, because /proc/net/dev is always readable.
+# ------------------------------------------------------------------------------
+read_iface_kernel_stats() {
+    awk -v inc="$NIC_IFACES" "$AWK_IFACE_KERNEL" /proc/net/dev 2>/dev/null || echo "0 0"
+}
+
+# Feed one fallback value through the same delta/continuity logic that
+# parse_counters uses for socket counters (shared code path, same rules).
+apply_kernel_counter() {
+    local k="$1" v="$2" alt="$3" prev
+    prev="${PREV_VAL[$k]:-}"
+    if [ -n "$prev" ] && [ "$v" -lt "$prev" ]; then
+        # NIC counter wrapped / interface reset: keep the lifetime counting.
+        case "$RESET_KEYS" in
+            *"|$k|"*)
+                CTR_OFF[$k]=$(( ${CTR_OFF[$k]:-0} + prev ))
+                RESTARTS=$(( RESTARTS + 1 ))
+                ;;
+        esac
+    fi
+    printf -v "$k" '%s' "$v"
+    CTR_ALT[$k]="$alt"
+    if [ -n "$prev" ] && [ "$v" -gt "$prev" ]; then
+        DELTA[$k]=$(( v - prev ))
+    else
+        DELTA[$k]=""
+    fi
+    PREV_VAL[$k]="$v"
+    num_commas "$v"
+    DV[$k]="$FMT_OUT"
+}
+
+update_kernel_counters() {
+    local out kp kd
+    # Only when this Suricata build does not expose capture kernel counters.
+    [ "${DV[KERNEL_PKTS]:-n/a}" = "n/a" ] || return 0
+    [ -r /proc/net/dev ] || return 0
+    read -r kp kd <<< "$(read_iface_kernel_stats)"
+    kp="$(safe_int "$kp")"; kd="$(safe_int "$kd")"
+    apply_kernel_counter KERNEL_PKTS    "$kp" "proc:/proc/net/dev"
+    apply_kernel_counter KERNEL_DROPS   "$kd" "proc:/proc/net/dev"
+    apply_kernel_counter KERNEL_IFDROPS "$kd" "proc:/proc/net/dev"
 }
 
 # Smooth mode switch bookkeeping (shown in the health section).
@@ -2232,6 +2386,33 @@ collect_eve_stats() {
 }
 
 # ------------------------------------------------------------------------------
+# ALERT LOGGING  (--log-hmr: sev 1-2 | --log-all: sev 1-3)
+#   Appends qualifying alerts from the parsed alert TSV to LOG_FILE. The TSV
+#   is re-scanned every refresh cycle, so each alert is keyed and logged only
+#   once (dedup on time + sid + signature + endpoints). Read-only wrt Suricata.
+# ------------------------------------------------------------------------------
+log_alerts() {
+    local tsv="$1" sev ts rest key maxsev=2
+    [ "$LOG_MODE" = "hmr" ] || [ "$LOG_MODE" = "all" ] || return 0
+    [ -n "$tsv" ] || return 0
+    [ "$LOG_MODE" = "all" ] && maxsev=3
+    while IFS=$'\t' read -r sev ts rest; do
+        [ -n "${sev:-}" ] || continue
+        case "$sev" in
+            1|2|3) ;;
+            *) continue ;;
+        esac
+        [ "$sev" -gt "$maxsev" ] && continue
+        rest="${rest//$'\t'/ }"
+        key="${ts}|${rest}"
+        [ -n "${LOG_SEEN[$key]:-}" ] && continue
+        LOG_SEEN[$key]=1
+        printf '%s sev=%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$sev" "$ts" "$rest" >> "$LOG_FILE"
+        LOG_WRITTEN=$(( LOG_WRITTEN + 1 ))
+    done < <(printf '%s\n' "$tsv")
+}
+
+# ------------------------------------------------------------------------------
 # ALERT COLLECTION
 # ------------------------------------------------------------------------------
 collect_recent_alerts() {
@@ -2251,6 +2432,9 @@ collect_recent_alerts() {
                | awk -v fp="$FP_REGEX" "$AWK_FASTLOG" 2>/dev/null)"
     fi
     [ -n "$tsv" ] || return 0
+
+    # --log-hmr / --log-all: append qualifying alerts to LOG_FILE (deduped).
+    log_alerts "$tsv"
 
     c_red=$'\033[1;31m'; c_yel=$'\033[33m'; c_cyn=$'\033[36m'
     c_mag=$'\033[35m';   c_dim=$'\033[2m';  c_rst=$'\033[0m'
@@ -2477,7 +2661,7 @@ show_health() {
         "Last fail:" "${SOCKET_FAIL_LAST_S}s" "$YELLOW"
     row "Load:" "$LOAD_LABEL" "$CYAN" \
         "Refresh:" "${REFRESH_INTERVAL}s" "$CYAN" \
-        "Health hold:" "${HEALTH_HOLD_S}s" "$CYAN"
+        "Alert log:" "${LOG_MODE} (${LOG_WRITTEN})" "$CYAN"
 }
 
 # ------------------------------------------------------------------------------
@@ -2660,7 +2844,7 @@ render_frame() {
 
     printf '\n'
     printf '%s\n' "${BLUE}${BOLD}${rule}${NC}"
-    printf '%s\n' "${WHITE}  Refresh every ${CYAN}${REFRESH_INTERVAL}s${NC} | ${WHITE}Stop: ${RED}q / Ctrl+C${NC} | ${WHITE}Log: ${CYAN}${FAST_LOG}${NC}"
+    printf '%s\n' "${WHITE}  Refresh every ${CYAN}${REFRESH_INTERVAL}s${NC} | ${WHITE}Stop: ${RED}q / Ctrl+C${NC} | ${WHITE}Log: ${CYAN}${FAST_LOG}${NC} | ${WHITE}Alert log: ${CYAN}${LOG_MODE} (${LOG_WRITTEN})${NC}"
     printf '%s\n' "${DIM}  Suridash ${Suridash_Version} - read-only mode: nothing in the Suricata configuration is modified.${NC}"
     printf '%s\n' "${BLUE}${BOLD}${rule}${NC}"
 }
@@ -2701,6 +2885,10 @@ collect_cycle() {
         # Frozen snapshot: deltas from the last tick would be misleading.
         DELTA=()
     fi
+    # Kernel counter fallback: when the Suricata build exposes no capture.*
+    # stats, feed real kernel packets/drops from /proc/net/dev through the
+    # same delta + continuity engine (also runs while the socket is busy).
+    update_kernel_counters
     compute_effective
     calculate_all_rates
     update_term_width
