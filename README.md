@@ -5,10 +5,44 @@
 # sl0ppy-SuriDash
 Sl0ppy-SuriDash is a bash based dashboard for suricata in IDS or IPS Mode
 
-# change log v1.4
+# change log v1.5
 ```
-# v1.4 changes (on top of v1.3):
-#   COUNTER CONTINUITY ENGINE (new)
+# v1.5 changes (on top of v1.4):
+#   ALERT LOGGING (new)
+#     * --log-hmr : append HIGH + MEDIUM risk alerts (severity 1-2) to
+#                   LOG_FILE (default /var/log/suridash-alerts.log).
+#     * --log-all : append LOW + MEDIUM + HIGH risk alerts (severity 1-3)
+#                   to LOG_FILE.
+#     * Alert severity mapping (Suricata convention): 1 = high, 2 = medium,
+#       3 = low. Severity 4+ / informational is never logged.
+#     * Each alert is logged exactly once (dedup on timestamp + sid +
+#       signature + endpoints) even though the scan window is re-read every
+#       refresh cycle. Works in interactive, --once and socket-busy modes.
+#     * Kernel capture counter fix: KERNEL_PKTS / KERNEL_DROPS /
+#       KERNEL_IFDROPS now also resolve through wildcard paths so they show
+#       correctly on every Suricata 7/8 build and capture mode. Suricata
+#       exposes these either flat (capture.kernel_packets), per-thread
+#       (summed automatically via the threads unwrap) or nested per
+#       ring/worker/iface (capture.nic-rings0.kernel_packets,
+#       capture.worker-rings1.kernel_drops, capture.<iface>.packets, ...).
+#       The wildcard alternatives (capture.*.kernel_packets etc.) sum the
+#       counter under EVERY capture instance, so multi-ring AF_PACKET,
+#       NFQ, netmap, PF and per-worker setups all report full totals
+#       instead of a stuck "n/a" or partial 0.
+#     * KERNEL COUNTER FALLBACK (new): many Suricata builds/modes expose NO
+#       capture.* stats at all (only capture_bypassed / local_capture_*), so
+#       KERNEL_PKTS / KERNEL_DROPS / KERNEL_IFDROPS used to sit at "n/a"
+#       forever. When the socket does not deliver capture counters, the
+#       dashboard now reads the kernel's own view from /proc/net/dev
+#       (rx+tx packets, rx+tx dropped on the sniff interfaces) and feeds it
+#       through the SAME delta + continuity engine as the socket counters:
+#       real kernel packets/drops, live "+N" deltas, a working drop ratio and
+#       capture-drop health penalties, monotonic across NIC counter resets.
+#       The counter source is visible in --check ("proc:/proc/net/dev").
+#     * New env: LOG_FILE (/var/log/suridash-alerts.log) - target of both flags.
+#
+# v1.4 changes (kept):
+#   COUNTER CONTINUITY ENGINE
 #     * Switching between the Suricata socket and the NIC counters (in either
 #       direction) can NEVER make the counters jump backwards, spike, or lose
 #       the traffic that was counted in the other mode. Everything the
@@ -48,7 +82,7 @@ Sl0ppy-SuriDash is a bash based dashboard for suricata in IDS or IPS Mode
 #       values LOWER smoothly when traffic lowers, in any mode.
 #     * Health section shows the current data mode (socket / nic / est),
 #       the number of mode switches and the carried-over cache.
-#   CONNECTION ERROR GRACE (new)
+#   CONNECTION ERROR GRACE
 #     * A FAILED socket (Suricata process gone / socket never found) is first
 #       treated like a busy socket: the dashboard keeps running from the NIC /
 #       estimator with the full continuity engine (rates, live totals and the
@@ -59,10 +93,6 @@ Sl0ppy-SuriDash is a bash based dashboard for suricata in IDS or IPS Mode
 #     * As soon as Suricata answers again (it is re-probed every cycle) the
 #       cached NIC/estimator traffic is merged back into the socket stats
 #       and a green "answered again after Xs offline" banner confirms it.
-#     * New env: NIC_STALE_S (6) - seconds without NIC counter movement
-#                (while traffic is expected) before estimator mode.
-#                EST_LABEL ("unit8200") - label for the estimator mode.
-#                FAIL_GRACE_S (3600) - banner window before the error page.
 #
 # v1.3 changes (kept):
 #   * Every suricatasc call wrapped in `timeout`; BUSY socket state with
@@ -83,6 +113,11 @@ Sl0ppy-SuriDash is a bash based dashboard for suricata in IDS or IPS Mode
 #     paths, object-sum lookups, "n/a" for keys your build does not expose.
 #   * health penalties held HEALTH_HOLD_S, flicker-free redraw, scrolling,
 #     pause, --once, --check, --debug-counters, --debug-parse.
+#
+# Usage:  sudo ./suridash.sh [-i SECONDS] [--log-hmr|--log-all] [--once]
+#         sudo ./suridash.sh [--check] [--debug-counters] [--debug-parse]
+#         sudo ./suridash.sh --help
+# ==============================================================================
 ```
 
 # sl0ppy-SuriDash Pre Requirements
