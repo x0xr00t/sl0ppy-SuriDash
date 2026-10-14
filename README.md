@@ -5,119 +5,20 @@
 # sl0ppy-SuriDash
 Sl0ppy-SuriDash is a bash based dashboard for suricata in IDS or IPS Mode
 
-# change log v1.5
+# change log v1.5.1
 ```
-# v1.5 changes (on top of v1.4):
-#   ALERT LOGGING (new)
-#     * --log-hmr : append HIGH + MEDIUM risk alerts (severity 1-2) to
-#                   LOG_FILE (default /var/log/suridash-alerts.log).
-#     * --log-all : append LOW + MEDIUM + HIGH risk alerts (severity 1-3)
-#                   to LOG_FILE.
-#     * Alert severity mapping (Suricata convention): 1 = high, 2 = medium,
-#       3 = low. Severity 4+ / informational is never logged.
-#     * Each alert is logged exactly once (dedup on timestamp + sid +
-#       signature + endpoints) even though the scan window is re-read every
-#       refresh cycle. Works in interactive, --once and socket-busy modes.
-#     * Kernel capture counter fix: KERNEL_PKTS / KERNEL_DROPS /
-#       KERNEL_IFDROPS now also resolve through wildcard paths so they show
-#       correctly on every Suricata 7/8 build and capture mode. Suricata
-#       exposes these either flat (capture.kernel_packets), per-thread
-#       (summed automatically via the threads unwrap) or nested per
-#       ring/worker/iface (capture.nic-rings0.kernel_packets,
-#       capture.worker-rings1.kernel_drops, capture.<iface>.packets, ...).
-#       The wildcard alternatives (capture.*.kernel_packets etc.) sum the
-#       counter under EVERY capture instance, so multi-ring AF_PACKET,
-#       NFQ, netmap, PF and per-worker setups all report full totals
-#       instead of a stuck "n/a" or partial 0.
-#     * KERNEL COUNTER FALLBACK (new): many Suricata builds/modes expose NO
-#       capture.* stats at all (only capture_bypassed / local_capture_*), so
-#       KERNEL_PKTS / KERNEL_DROPS / KERNEL_IFDROPS used to sit at "n/a"
-#       forever. When the socket does not deliver capture counters, the
-#       dashboard now reads the kernel's own view from /proc/net/dev
-#       (rx+tx packets, rx+tx dropped on the sniff interfaces) and feeds it
-#       through the SAME delta + continuity engine as the socket counters:
-#       real kernel packets/drops, live "+N" deltas, a working drop ratio and
-#       capture-drop health penalties, monotonic across NIC counter resets.
-#       The counter source is visible in --check ("proc:/proc/net/dev").
-#     * New env: LOG_FILE (/var/log/suridash-alerts.log) - target of both flags.
-#
-# v1.4 changes (kept):
-#   COUNTER CONTINUITY ENGINE
-#     * Switching between the Suricata socket and the NIC counters (in either
-#       direction) can NEVER make the counters jump backwards, spike, or lose
-#       the traffic that was counted in the other mode. Everything the
-#       dashboard counted while running on NIC / estimator data is carried
-#       over ("cached") and merged back into the socket stats the moment the
-#       socket delivers a fresh snapshot again - the totals keep counting as
-#       if nothing happened.
-#     * Monotonic totals: "Total pkts (live)" / "Total bytes (live)" never
-#       decrease. On every fresh socket snapshot the engine takes
-#       max(socket value, cached live value) as the new anchor, so the NIC
-#       traffic seen during a busy socket window is never lost when the
-#       socket comes back (Suricata may have missed packets while busy - the
-#       cached NIC numbers are the more complete truth and they are kept).
-#     * Suricata restart / counter reset handling: when a lifetime counter
-#       (packets, bytes, flows, alerts, drops, ARP) restarts from 0, the
-#       previously observed lifetime is added as an offset, so adjusted
-#       lifetime totals keep counting across Suricata restarts. The raw
-#       Suricata value is still shown per counter; the rate/live-total engine
-#       uses the adjusted monotonic value. No fake "counter reset" rate
-#       spikes any more either.
-#     * NIC BUSY HANDLING (unit8200 workaround/bypass):
-#         - If /proc/net/dev is unreadable, or the NIC counters freeze while
-#           the socket is also busy, the dashboard switches to the
-#           estimator mode (labelled "unit8200 est" by default, override
-#           with EST_LABEL). Rates are held and decayed smoothly, and the
-#           live totals are extrapolated at the decayed rate so the numbers
-#           keep moving naturally instead of freezing.
-#         - Estimator mode is left automatically as soon as either the
-#           socket answers again or the NIC counters start moving again.
-#     * Rate continuity across every mode switch: socket rates are always
-#       computed over the REAL elapsed time between usable data points
-#       (snapshot -> snapshot, NIC -> socket, estimator -> socket), so the
-#       first socket snapshot after a busy/est window is the AVERAGE over the
-#       whole window: no spikes, no freeze, no visual glitch.
-#     * One decay engine for all held rates (pps, Mbit/s, drops/s, alerts/s,
-#       flows/s, ARP pps) that runs in every non-fresh mode so displayed
-#       values LOWER smoothly when traffic lowers, in any mode.
-#     * Health section shows the current data mode (socket / nic / est),
-#       the number of mode switches and the carried-over cache.
-#   CONNECTION ERROR GRACE
-#     * A FAILED socket (Suricata process gone / socket never found) is first
-#       treated like a busy socket: the dashboard keeps running from the NIC /
-#       estimator with the full continuity engine (rates, live totals and the
-#       cache all keep counting, decay as needed) and shows a red banner with
-#       a countdown instead of the error page.
-#     * Only after FAIL_GRACE_S (default 3600s = 1 hour) of continuous
-#       failure is the full connection error page shown.
-#     * As soon as Suricata answers again (it is re-probed every cycle) the
-#       cached NIC/estimator traffic is merged back into the socket stats
-#       and a green "answered again after Xs offline" banner confirms it.
-#
-# v1.3 changes (kept):
-#   * Every suricatasc call wrapped in `timeout`; BUSY socket state with
-#     frozen snapshot, NIC fallback, periodic re-probe (SOCKET_RETRY_S),
-#     automatic recovery, real socket discovery, baseline guard.
-#   * Virtual machines detected and annotated; SMART/RAID/SEL deep probes on
-#     the slow cadence; cheap /sys probes every cycle.
-# v1.2 changes (kept):
-#   * Hardware / vendor health section (IBM, Lenovo, Dell, HP/HPE, Fujitsu,
-#     Supermicro, Huawei, ASUS, Acer, MSI, Gigabyte, Apple, Oracle/Sun,
-#     Toshiba, Samsung + virtual platforms), CPU temp chain
-#     (thermal_zone -> lm-sensors -> ThinkPad ACPI -> IPMI SDR), battery,
-#     CPU freq/throttle, SMART (-n standby), RAID toolchains, EDAC, IPMI SEL.
-#   * Live totals interpolated from /proc/net/dev between stats ticks,
-#     per-counter "+N" deltas in every section, rate decay, ARP rate.
-# v1.1 highlights (kept):
-#   * counter map audited against the Suricata 7/8 stats tree, wildcard
-#     paths, object-sum lookups, "n/a" for keys your build does not expose.
-#   * health penalties held HEALTH_HOLD_S, flicker-free redraw, scrolling,
-#     pause, --once, --check, --debug-counters, --debug-parse.
-#
-# Usage:  sudo ./suridash.sh [-i SECONDS] [--log-hmr|--log-all] [--once]
-#         sudo ./suridash.sh [--check] [--debug-counters] [--debug-parse]
-#         sudo ./suridash.sh --help
-# ==============================================================================
+v1.5.1 changes (health penalty fixes, on top of v1.5):
+#   * CAPTURE-DROP PENALTY SOFTENED: a single dropped packet (e.g. one lost
+#     ICMP ping) in one stats window no longer slams the health score.
+#     - Dead-zone: drop windows below 0.5% cost 0 points (LAN noise).
+#     - Weight halved: 3 points per full percent instead of 6, cap 30 kept.
+#     - Two-tick rule: the penalty only fires after two CONSECUTIVE windows
+#       with drops - one bad tick is ignored, sustained drops still show.
+#   * COSMETIC PENALTIES REDUCED: frag-timeouts and bad-checksums now cost
+#     1 point each instead of 2 (normal ICMP / offload noise on a LAN).
+#   * BUGFIX: penalty reasons are now appended to "reasons" (the loop used
+#     the misspelled variable "reason", so the Reasons: line never listed
+#     the active penalties - you could not see WHY the score was ~70%).
 ```
 
 # sl0ppy-SuriDash Pre Requirements
