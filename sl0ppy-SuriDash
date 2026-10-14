@@ -127,18 +127,7 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
     exit 1
 fi
 
-if [ -n "${LC_ALL:-}" ];============================================================================================================================================
-                                                   sl0ppy SURICATA HARDENED IPS DASHBOARD                                                   
-============================================================================================================================================
-  Status:        ACTIVE         Uptime:        0d 00h 09m 47s Rules active:  53237          
-  Pps:           4.41           Mbit/s:        0.00           Drops/s:       0.11           
-  Health:        88%            Peak pps:      25.82          Peak Mbit/s:   0.13           
-  Total pkts:    7,491,258 (+13)Total bytes:   6.2GiB (+1,376)ARP rate:      0.00/s         
-  Alerts/s:      0.00           New flows/s:   0.00           Data mode:     nic            
-  Suricata:      8.0.7 RELEASE  Suridash:      v1.5           Refresh:       2s             
-    stats: 67 counters live, 8 n/a on this build
---------------------------------------------------------------------------------------------------------------------------------------------
-  Packet rate (auto-s then export LANG="$LC_ALL"; unset LC_ALL; fi
+if [ -n "${LC_ALL:-}" ]; then export LANG="$LC_ALL"; unset LC_ALL; fi
 export LC_NUMERIC=C
 
 Suridash_Version="v1.5"
@@ -1497,43 +1486,30 @@ compute_health() {
     if [ "$SOCKET_STATUS" = "OK" ] && [ "$SOCKET_FRESH" = "1" ]; then
         if [ "$PH_INIT" = "1" ]; then
             dd=$(( KERNEL_DROPS - PH_KD ))
-            dp=$(( KERNEL_PKTS - PH_KP ))
-
-            if [ "$dd" -gt 0 ] && [ "$dp" -gt 0 ]; then
-                read -r pen pct <<< "$(
-                    awk -v d="$dd" -v p="$dp" "$AWK_HPDROP"
-                )"
-
+            dp=$(( KERNEL_PKTS  - PH_KP ))
+            if [ "$dd" -gt 0 ]; then
+                read -r pen pct <<< "$(awk -v d="$dd" -v p="$dp" "$AWK_HPDROP")"
                 DROP_PCT_NOW="$pct"
-
-                # Penalize significant capture loss, not isolated drops.
-                if [ "$dd" -ge 3 ] && awk -v pct="$pct" \
-                    'BEGIN { exit !(pct >= 1.0) }'; then
-                    hp_bump capture-drop "$pen" \
-                        "capture-drop ${pct}%"
-                fi
+                hp_bump capture-drop "$pen" "capture-drop ${pct}%"
             fi
         fi
+        PH_KD="$KERNEL_DROPS"; PH_KP="$KERNEL_PKTS"; PH_INIT=1
 
-        PH_KD="$KERNEL_DROPS"
-        PH_KP="$KERNEL_PKTS"
-        PH_INIT=1
-
-        delta_pos flow-emergency       "$FLOW_EMERGENCY" && hp_bump flow-emergency 20
-        delta_pos flow-memcap          "$FLOW_MEMCAP"    && hp_bump flow-memcap 10
-        delta_pos ssn-memcap-drop      "$MEMCAP_DROPS"   && hp_bump ssn-memcap-drop 10
-        delta_pos segment-memcap-drop  "$SEG_MEMCAP"     && hp_bump segment-memcap-drop 5
-        delta_pos frag-memcap          "$FRAG_MEMCAP"    && hp_bump frag-memcap 5
-        delta_pos alert-queue-overflow "$DETECT_QUEUE"   && hp_bump alert-queue-overflow 5
-        delta_pos app-layer-errors     "$AL_ERR"         && hp_bump app-layer-errors 3
-        delta_pos frag-timeouts        "$FRAG_TIMEOUTS"  && hp_bump frag-timeouts 2
-        delta_pos bad-checksums        "$TCP_BAD_CSUM"    && hp_bump bad-checksums 2
+        delta_pos flow-emergency       "$FLOW_EMERGENCY"  && hp_bump flow-emergency       20
+        delta_pos flow-memcap          "$FLOW_MEMCAP"     && hp_bump flow-memcap          10
+        delta_pos ssn-memcap-drop      "$MEMCAP_DROPS"    && hp_bump ssn-memcap-drop      10
+        delta_pos segment-memcap-drop  "$SEG_MEMCAP"      && hp_bump segment-memcap-drop   5
+        delta_pos frag-memcap          "$FRAG_MEMCAP"     && hp_bump frag-memcap           5
+        delta_pos alert-queue-overflow "$DETECT_QUEUE"    && hp_bump alert-queue-overflow  5
+        delta_pos app-layer-errors     "$AL_ERR"          && hp_bump app-layer-errors      3
+        delta_pos frag-timeouts        "$FRAG_TIMEOUTS"   && hp_bump frag-timeouts         2
+        delta_pos bad-checksums        "$TCP_BAD_CSUM"    && hp_bump bad-checksums        2
     fi
 
     for name in "${HP_ORDER[@]}"; do
         if hp_active "$name"; then
             score=$(( score - ${HP_PEN[$name]:-0} ))
-            reasons+="${HP_TXT[$name]:-$name}; "
+            reason+="${HP_TXT[$name]:-$name}; "
         fi
     done
     if [ "$SOCKET_STATUS" = "BUSY" ]; then
