@@ -140,11 +140,11 @@ The following is documentation-only example data. Use your actual LAN prefix, no
 
 | Purpose | Example |
 |---|---|
-| LAN IPv4 network | `192.168.2.0/24` |
-| Router IPv4 address | `192.168.2.254` |
-| Sensor IPv4 address | `192.168.2.10` |
-| LAN IPv6 prefix | `2001:db8:1234:1::/64` |
-| Sensor IPv6 address | `2001:db8:1234:1::10` |
+| LAN IPv4 network | `192.168.x.x/24` |
+| Router IPv4 address | `192.168.x.254` |
+| Sensor IPv4 address | `192.168.x.10` |
+| LAN IPv6 prefix | `2001:xxx:xxxx:1::/64` |
+| Sensor IPv6 address | `2001:xxx:xxxx:1::10` |
 
 `2001:db8::/32` is reserved for documentation. Replace it with your real IPv6 prefix before deployment.
 
