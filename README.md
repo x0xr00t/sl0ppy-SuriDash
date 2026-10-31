@@ -155,7 +155,7 @@ For one IPv4 LAN:
 ```yaml
 vars:
   address-groups:
-    HOME_NET: "[192.168.2.0/24]"
+    HOME_NET: "[192.168.x.0/24]"
     EXTERNAL_NET: "!$HOME_NET"
 ```
 
@@ -164,7 +164,7 @@ For a dual-stack LAN:
 ```yaml
 vars:
   address-groups:
-    HOME_NET: "[192.168.2.0/24, 2001:db8:1234:1::/64]"
+    HOME_NET: "[192.168.x.0/24, 2001:db8:1234:1::/64]"
     EXTERNAL_NET: "!$HOME_NET"
 ```
 
@@ -173,7 +173,7 @@ For multiple internal networks:
 ```yaml
 vars:
   address-groups:
-    HOME_NET: "[192.168.2.0/24, 192.168.10.0/24, 10.20.0.0/16, 2001:db8:1234:1::/64]"
+    HOME_NET: "[192.168.x.0/24, 192.168.x.0/24, 10.20.0.0/16, 2001:xxx:xxxx:1::/64]"
     EXTERNAL_NET: "!$HOME_NET"
 ```
 
