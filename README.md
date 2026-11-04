@@ -58,20 +58,20 @@ Recommended platform: Linux with Bash and a supported Suricata build.
 
 On Debian, Kali, Ubuntu, and derivatives:
 
-```bash
+```
 sudo apt update
 sudo apt install -y suricata suricata-update jq coreutils ncurses-bin iproute2
 ```
 
 Useful optional diagnostics:
 
-```bash
+```
 sudo apt install -y ethtool tcpdump nftables iptables
 ```
 
 Check installed versions and available commands:
 
-```bash
+```
 suricata --build-info
 suricata --version
 suricatasc --help
@@ -81,7 +81,7 @@ bash --version
 
 SuriDash itself is a Bash dashboard. Run it with Bash, not `sh`:
 
-```bash
+```
 bash ./sl0ppy-SuriDash
 ```
 
@@ -97,14 +97,14 @@ Distribution repositories can ship different Suricata versions. Use the official
 
 Clone the repository and enter its directory:
 
-```bash
+```
 git clone https://github.com/x0xr00t/sl0ppy-SuriDash.git
 cd sl0ppy-SuriDash
 ```
 
 Make the dashboard executable:
 
-```bash
+```
 chmod +x ./sl0ppy-SuriDash
 ```
 
@@ -116,7 +116,7 @@ If your checkout uses another script filename, substitute that filename in the c
 
 Do not copy interface names or example addresses blindly. Discover the actual interface names and address ranges on the machine that will run Suricata.
 
-```bash
+```
 ip -br link
 ip -br -4 address
 ip -br -6 address
@@ -126,7 +126,7 @@ ip -6 route
 
 Inspect one interface in detail:
 
-```bash
+```
 ip -details link show dev enp3s0
 ip -4 address show dev enp3s0
 ip -6 address show dev enp3s0
@@ -152,7 +152,7 @@ The following is documentation-only example data. Use your actual LAN prefix, no
 
 For one IPv4 LAN:
 
-```yaml
+```
 vars:
   address-groups:
     HOME_NET: "[192.168.x.0/24]"
@@ -161,7 +161,7 @@ vars:
 
 For a dual-stack LAN:
 
-```yaml
+```
 vars:
   address-groups:
     HOME_NET: "[192.168.x.0/24, 2001:db8:1234:1::/64]"
@@ -170,7 +170,7 @@ vars:
 
 For multiple internal networks:
 
-```yaml
+```
 vars:
   address-groups:
     HOME_NET: "[192.168.x.0/24, 192.168.x.0/24, 10.20.0.0/16, 2001:xxx:xxxx:1::/64]"
@@ -192,7 +192,7 @@ Important:
 
 Edit the existing configuration:
 
-```bash
+```
 sudo cp -a /etc/suricata/suricata.yaml \
   "/etc/suricata/suricata.yaml.backup.$(date +%Y%m%d-%H%M%S)"
 
@@ -205,7 +205,7 @@ Suricata's YAML file contains many sections. **Merge the following settings into
 
 A common Debian/Kali/Ubuntu package layout is:
 
-```yaml
+```
 default-rule-path: /var/lib/suricata/rules
 
 rule-files:
@@ -214,7 +214,7 @@ rule-files:
 
 Use the actual rule filename installed by `suricata-update`. Check it with:
 
-```bash
+```
 sudo find /var/lib/suricata/rules -maxdepth 1 -type f -name '*.rules' -print
 ```
 
@@ -224,7 +224,7 @@ If your installation uses a different rule directory or filename, keep the packa
 
 Merge into the existing `stats` section:
 
-```yaml
+```
 stats:
   enabled: yes
   interval: 2
@@ -236,7 +236,7 @@ A two-second interval gives the dashboard relatively frequent counter updates. I
 
 Merge the required event types into the existing `outputs` list. Do not create a second `outputs` key.
 
-```yaml
+```
 outputs:
   - eve-log:
       enabled: yes
@@ -266,7 +266,7 @@ Notes:
 
 A typical log directory is:
 
-```yaml
+```
 default-log-dir: /var/log/suricata
 ```
 
@@ -280,7 +280,7 @@ SuriDash needs access to Suricata's Unix command socket for runtime information.
 
 In the existing `suricata.yaml`, enable the socket:
 
-```yaml
+```
 unix-command:
   enabled: yes
   # filename is optional; if set, it is relative to Suricata's local state base directory
@@ -291,7 +291,7 @@ Do not assume the socket is always `/run/suricata/` or `/var/run/suricata/`. The
 
 Find the live socket:
 
-```bash
+```
 sudo find /run /var/run /var/lib/suricata \
   -type s -name '*suricata*.socket' -o -type s -name 'suricata-command.socket' \
   2>/dev/null
@@ -299,14 +299,14 @@ sudo find /run /var/run /var/lib/suricata \
 
 If the `find` expression is ambiguous on your system, use:
 
-```bash
+```
 sudo find /run /var/run /var/lib/suricata \
   -type s -name 'suricata-command.socket' 2>/dev/null
 ```
 
 Test the socket using the discovered path:
 
-```bash
+```
 sudo suricatasc -s /run/suricata/suricata-command.socket -c version
 ```
 
@@ -314,7 +314,7 @@ Replace the example path with the path returned by `find`.
 
 If your `suricatasc` build does not accept `-s`, inspect its syntax:
 
-```bash
+```
 suricatasc --help
 ```
 
@@ -326,19 +326,19 @@ The socket must exist and be accessible to the account running the client. Do no
 
 Fetch the configured rule sources:
 
-```bash
+```
 sudo suricata-update
 ```
 
 List available sources:
 
-```bash
+```
 sudo suricata-update list-sources
 ```
 
 Enable the Emerging Threats Open rules source if it is not already enabled:
 
-```bash
+```
 sudo suricata-update --enable-source et/open
 sudo suricata-update
 ```
@@ -347,7 +347,7 @@ Source names can vary with `suricata-update` versions. Check `list-sources` and 
 
 Check that rules were written:
 
-```bash
+```
 sudo find /var/lib/suricata/rules -maxdepth 1 -type f -name '*.rules' -ls
 ```
 
@@ -359,7 +359,7 @@ Rule updates should be scheduled and monitored. An update command succeeding doe
 
 Always test the configuration before restarting the service:
 
-```bash
+```
 sudo suricata -T -c /etc/suricata/suricata.yaml
 ```
 
@@ -367,14 +367,14 @@ Proceed only if the configuration test completes successfully.
 
 Start and enable the packaged service:
 
-```bash
+```
 sudo systemctl enable --now suricata
 sudo systemctl status suricata --no-pager
 ```
 
 Inspect recent logs:
 
-```bash
+```
 sudo journalctl -u suricata -n 100 --no-pager
 ```
 
@@ -388,7 +388,7 @@ IDS is the recommended starting point. It observes traffic and generates alerts 
 
 For a simple Linux interface capture, configure the existing `af-packet` section for the actual monitoring interface:
 
-```yaml
+```
 af-packet:
   - interface: enp3s0
     cluster-id: 99
@@ -402,20 +402,20 @@ For a sensor connected to a switch mirror/SPAN port, configure the switch mirror
 
 Validate and restart:
 
-```bash
+```
 sudo suricata -T -c /etc/suricata/suricata.yaml
 sudo systemctl restart suricata
 ```
 
 Check events:
 
-```bash
+```
 sudo tail -F /var/log/suricata/eve.json
 ```
 
 Show alerts only:
 
-```bash
+```
 sudo jq -c 'select(.event_type == "alert")' \
   /var/log/suricata/eve.json
 ```
@@ -432,7 +432,7 @@ AF_PACKET IPS is a Layer-2 inline design. Suricata receives traffic on one inter
 
 Use this design when the Linux machine is physically placed between two network segments, for example:
 
-```text
+```
 Internet / upstream
         |
      [eth0]
@@ -453,7 +453,7 @@ The interface names below are examples. Confirm the actual physical ports before
 
 Merge this into the existing `af-packet` section:
 
-```yaml
+```
 af-packet:
   - interface: eth0
     threads: 1
@@ -489,7 +489,7 @@ Do not copy the old example's `ring-size: 200000`, `tpacket-v3: yes`, or `topo-g
 
 In the existing stream configuration, ensure inline mode is enabled:
 
-```yaml
+```
 stream:
   inline: auto
 ```
@@ -500,7 +500,7 @@ Use `yes` only when you specifically intend to force inline stream handling and 
 
 For a transparent Layer-2 inline pair, the interfaces normally do not need IP addresses:
 
-```bash
+```
 sudo ip link set dev eth0 up
 sudo ip link set dev eth1 up
 
@@ -512,7 +512,7 @@ Do not remove addresses from interfaces remotely if one of them is your active m
 
 Check and align MTU:
 
-```bash
+```
 ip link show dev eth0
 ip link show dev eth1
 ```
@@ -527,7 +527,7 @@ sudo suricata -T -c /etc/suricata/suricata.yaml
 
 After validation, use the package's service configuration to start Suricata with the AF_PACKET interfaces configured in YAML. If testing manually, stop the service first to avoid two Suricata processes opening the same interfaces:
 
-```bash
+```
 sudo systemctl stop suricata
 sudo suricata -c /etc/suricata/suricata.yaml \
   --af-packet=eth0 --af-packet=eth1
@@ -553,7 +553,7 @@ Unlike AF_PACKET bridge mode, NFQUEUE does not require a pair of physical interf
 
 For a Linux router forwarding traffic between `eth0` and `eth1`, use the `FORWARD` chain. This example sends IPv4 TCP and UDP packets in both directions to queue 0:
 
-```bash
+```
 sudo iptables -I FORWARD 1 -i eth0 -o eth1 -p tcp \
   -j NFQUEUE --queue-num 0
 
@@ -571,7 +571,7 @@ Replace `eth0` and `eth1` with the real ingress and egress interfaces. If you in
 
 For IPv6, create equivalent rules with `ip6tables`:
 
-```bash
+```
 sudo ip6tables -I FORWARD 1 -i eth0 -o eth1 \
   -j NFQUEUE --queue-num 0
 
@@ -587,7 +587,7 @@ Only use `INPUT` and `OUTPUT` when you intentionally want to inspect traffic des
 
 Example for local IPv4 TCP traffic:
 
-```bash
+```
 sudo iptables -I INPUT 1 -p tcp \
   -j NFQUEUE --queue-num 0
 
@@ -601,7 +601,7 @@ This example intentionally queues only TCP. Add other protocols only when requir
 
 The queue number in the firewall rule and Suricata command must match:
 
-```bash
+```
 sudo suricata -c /etc/suricata/suricata.yaml -q 0
 ```
 
@@ -609,13 +609,13 @@ For a persistent deployment, configure the Suricata service to start with `-q 0`
 
 Check the installed command-line options:
 
-```bash
+```
 suricata --help | grep -A2 -B2 -- '-q'
 ```
 
 For multiple queues, Suricata must be started with every queue ID, for example:
 
-```bash
+```
 sudo suricata -c /etc/suricata/suricata.yaml -q 0 -q 1
 ```
 
@@ -625,7 +625,7 @@ The firewall must send traffic to those same queue IDs. Do not configure a queue
 
 Use this alternative if your firewall is managed with nftables. This creates a dedicated forward hook chain and queues only traffic crossing the named interfaces:
 
-```bash
+```
 sudo nft add table inet suricata
 sudo nft 'add chain inet suricata forward { type filter hook forward priority 10; policy accept; }'
 
@@ -635,13 +635,13 @@ sudo nft add rule inet suricata forward iifname "eth1" oifname "eth0" queue num 
 
 Start Suricata with the same queue:
 
-```bash
+```
 sudo suricata -c /etc/suricata/suricata.yaml -q 0
 ```
 
 The `inet` family covers IPv4 and IPv6. Review the complete nftables ruleset and hook priorities before deployment:
 
-```bash
+```
 sudo nft list ruleset
 ```
 
@@ -657,7 +657,7 @@ Without bypass, packets sent to a queue with no listener can be dropped. Choose 
 
 ### Verify Suricata is running
 
-```bash
+```
 sudo systemctl status suricata --no-pager
 sudo journalctl -u suricata -n 100 --no-pager
 ```
@@ -666,27 +666,27 @@ sudo journalctl -u suricata -n 100 --no-pager
 
 Find the socket:
 
-```bash
+```
 sudo find /run /var/run /var/lib/suricata \
   -type s -name 'suricata-command.socket' 2>/dev/null
 ```
 
 Use the actual path:
 
-```bash
+```
 sudo suricatasc -s /run/suricata/suricata-command.socket -c version
 ```
 
 ### Verify EVE output
 
-```bash
+```
 sudo test -s /var/log/suricata/eve.json && echo "EVE log exists"
 sudo tail -F /var/log/suricata/eve.json
 ```
 
 Count recent alert events:
 
-```bash
+```
 sudo jq -c 'select(.event_type == "alert")' \
   /var/log/suricata/eve.json | tail
 ```
@@ -695,7 +695,7 @@ sudo jq -c 'select(.event_type == "alert")' \
 
 For iptables:
 
-```bash
+```
 sudo iptables -vnL FORWARD --line-numbers
 sudo ip6tables -vnL FORWARD --line-numbers
 ```
@@ -710,7 +710,7 @@ Packet counters should increase when matching traffic crosses the configured pat
 
 ### Verify AF_PACKET interfaces
 
-```bash
+```
 ip -s link show dev eth0
 ip -s link show dev eth1
 ```
@@ -736,21 +736,57 @@ Do not test blocking against third-party systems without authorization.
 
 Once Suricata is running and the command socket and logs are available:
 
-```bash
+```
 sudo bash ./sl0ppy-SuriDash
 ```
 
 If the file has its executable bit set:
 
-```bash
+```
 sudo ./sl0ppy-SuriDash
 ```
 
-The dashboard is a monitor. It does not enable AF_PACKET IPS, start NFQUEUE mode, or add firewall rules.
+## one can also add virtual for 1 eth0 port only
+
+### install
+```
+sudo ip link add veth0 type veth peer name veth1
+sudo ip link set dev veth0 up
+sudo ip link set dev veth1 up
+```
+
+### config 
+```
+af-packet:
+  - interface: eth0
+    cluster-id: 98
+    cluster-type: cluster_flow
+    defrag: no
+    copy-mode: ips
+    copy-iface: veth0
+    buffer-size: 64535
+  - interface: veth0
+    cluster-id: 97
+    cluster-type: cluster_flow
+    defrag: no
+    copy-mode: ips
+    copy-iface: eth0
+    buffer-size: 64535
+
+```
+
+# stream 
+```
+stream:
+  inline: yes
+```
+* These settings ^ ^ are handy if u ran a single internet port.
+
+### x0xr00t also makes custom private suricata detections modules, but they stay private source.
 
 ### Usage
 
-```text
+```
 Usage: sudo ./sl0ppy-SuriDash [options]
 
   -i, --interval SEC    Refresh interval in seconds
@@ -775,7 +811,7 @@ The exact default refresh interval is determined by the checked-out SuriDash scr
 
 Useful diagnostics:
 
-```bash
+```
 sudo ./sl0ppy-SuriDash --check
 sudo ./sl0ppy-SuriDash --once
 sudo ./sl0ppy-SuriDash --debug-counters
@@ -789,7 +825,7 @@ If the script is named differently, replace the executable name accordingly.
 
 Docker deployment depends on the repository's actual Compose file, Dockerfile, entrypoint, mounted Suricata configuration, and privileges. The following commands apply only if the checkout contains a working `compose.yaml` or `docker-compose.yml` with services named `suricata` and `suridash`.
 
-```bash
+```
 docker compose config
 docker compose build
 docker compose up -d suricata
@@ -798,13 +834,13 @@ docker compose logs -f suricata
 
 Run the dashboard container:
 
-```bash
+```
 docker compose run --rm suridash
 ```
 
 If the image entrypoint forwards arguments to SuriDash:
 
-```bash
+```
 docker compose run --rm suridash --check
 ```
 
@@ -825,7 +861,7 @@ The Docker commands above are not a substitute for checking the repository's Com
 
 ### Socket not found
 
-```bash
+```
 sudo find /run /var/run /var/lib/suricata \
   -type s -name 'suricata-command.socket' 2>/dev/null
 
@@ -846,7 +882,7 @@ Check `unix-command.enabled`, the local-state directory, and the actual socket f
 
 No alerts does not necessarily mean the sensor is broken. Check:
 
-```bash
+```
 sudo jq -c 'select(.event_type == "stats")' \
   /var/log/suricata/eve.json | tail
 
@@ -862,7 +898,7 @@ If Suricata is not listening on the configured queue, queued packets may be drop
 
 ### AF_PACKET traffic stops
 
-Check:
+ Check:
 
 - Correct physical cabling and interface pairing.
 - Both interfaces are up.
@@ -873,9 +909,9 @@ Check:
 
 ### Dashboard shows missing or zero counters
 
-Run:
+ Run:
 
-```bash
+```
 sudo ./sl0ppy-SuriDash --check
 sudo suricatasc -s /path/to/actual/socket -c version
 ```
@@ -884,7 +920,7 @@ Replace the socket path. A zero counter can mean no matching traffic, a counter-
 
 ### YAML validation fails
 
-```bash
+```
 sudo suricata -T -c /etc/suricata/suricata.yaml -v
 ```
 
@@ -907,18 +943,18 @@ sudo iptables -D FORWARD -i eth1 -o eth0 -p tcp -j NFQUEUE --queue-num 0
 sudo iptables -D FORWARD -i eth1 -o eth0 -p udp -j NFQUEUE --queue-num 0
 ```
 
-For the IPv6 example:
+### For the IPv6 example:
 
-```bash
+```
 sudo ip6tables -D FORWARD -i eth0 -o eth1 -j NFQUEUE --queue-num 0
 sudo ip6tables -D FORWARD -i eth1 -o eth0 -j NFQUEUE --queue-num 0
 ```
 
-If you installed the local-host `INPUT`/`OUTPUT` example, remove those exact rules instead. If a command reports that the rule does not exist, inspect the active ruleset and do not delete unrelated rules.
+* If you installed the local-host `INPUT`/`OUTPUT` example, remove those exact rules instead. If a command reports that the rule does not exist, inspect the active ruleset and do not delete unrelated rules.
 
 ### Remove only the example nftables table
 
-```bash
+```
 sudo nft delete table inet suricata
 ```
 
