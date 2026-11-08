@@ -807,6 +807,24 @@ Keys:
   G                    Bottom
 ```
 
+# br0 linking 
+
+```
+# 1. Maak de bridge interface aan   
+sudo ip link add name br0 type bridge
+
+# 2. Hang je fysieke internetkaart en de virtuele poort in de bridge
+sudo ip link set eth0 master br0
+sudo ip link set veth0 master br0
+
+# 3. Zet de bridge en de virtuele adapters live (UP)
+sudo ip link set br0 up
+sudo ip link set veth0 up
+sudo ip link set veth1 up
+
+```
+* dont forget to set dhcp automatic on br0 to enable inet working. 
+
 The exact default refresh interval is determined by the checked-out SuriDash script.
 
 Useful diagnostics:
